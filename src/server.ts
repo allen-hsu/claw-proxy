@@ -167,6 +167,7 @@ function handleStream(
   });
 
   proc.start(prompt, {
+    oauthToken: account.account.oauthToken,
     configDir: account.account.configDir,
     model,
     timeoutMs: config.timeoutMs,
@@ -223,6 +224,7 @@ function handleSync(
   });
 
   proc.start(prompt, {
+    oauthToken: account.account.oauthToken,
     configDir: account.account.configDir,
     model,
     timeoutMs: config.timeoutMs,

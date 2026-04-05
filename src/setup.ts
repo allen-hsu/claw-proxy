@@ -1,5 +1,4 @@
-import { execSync, spawnSync } from "child_process";
-import { existsSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
 import type { Config } from "./config.js";
 
 /** Check if Claude CLI is installed. */
@@ -12,58 +11,43 @@ export function checkClaude(): { ok: boolean; version?: string; error?: string }
   }
 }
 
-/** Check if an account config dir has credentials. */
-export function isAccountLoggedIn(configDir: string): boolean {
-  // On Linux, credentials are in .credentials.json
-  // On macOS, they're in Keychain but the config dir should still exist with state
-  if (!existsSync(configDir)) return false;
-  // Check for .credentials.json (Linux) or settings files that indicate login
-  const credFile = `${configDir}/.credentials.json`;
-  const stateFile = `${configDir}/../.claude.json`;
-  return existsSync(credFile) || existsSync(`${configDir}/settings.json`);
-}
-
-/** Interactive login for a specific account. */
-export function loginAccount(configDir: string, name: string): boolean {
-  console.log(`\n--- Logging in ${name} ---`);
-  console.log(`Config dir: ${configDir}`);
-
-  if (!existsSync(configDir)) {
-    mkdirSync(configDir, { mode: 0o700, recursive: true });
-  }
-
-  const result = spawnSync("claude", ["auth", "login"], {
-    env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
-    stdio: "inherit",
-  });
-
-  return result.status === 0;
-}
-
-/** Run interactive setup for all accounts. */
+/** Run setup — just prints instructions since tokens go in config.json. */
 export function runSetup(config: Config): void {
-  console.log("=== Claw Proxy Setup ===\n");
+  console.log(`
+=== Claw Proxy Setup ===
 
-  const cli = checkClaude();
-  if (!cli.ok) {
-    console.error(cli.error);
-    process.exit(1);
-  }
-  console.log(`Claude CLI: ${cli.version}`);
+Step 1: Generate a token for each account
 
-  for (const account of config.accounts) {
-    const loggedIn = isAccountLoggedIn(account.configDir);
-    if (loggedIn) {
-      console.log(`\n[${account.name}] Already has config at ${account.configDir}`);
-      console.log("  (re-run 'claude auth login' manually to refresh if needed)");
-    } else {
-      console.log(`\n[${account.name}] Not logged in.`);
-      loginAccount(account.configDir, account.name);
+  For each Claude Max account, run:
+
+    claude setup-token
+
+  This opens a browser, you log in, and it prints a long OAuth token.
+  Copy it.
+
+Step 2: Paste tokens into config
+
+  Edit: ~/.claw-proxy/config.json
+
+  Put each token in the "oauthToken" field:
+
+    {
+      "accounts": [
+        { "name": "account-1", "oauthToken": "<token from account A>" },
+        { "name": "account-2", "oauthToken": "<token from account B>" },
+        { "name": "account-3", "oauthToken": "<token from account C>" }
+      ]
     }
-  }
 
-  console.log("\n=== Setup complete ===");
-  console.log(`Config: ~/.claw-proxy/config.json`);
-  console.log(`Bearer token: ${config.bearerToken}`);
-  console.log(`\nStart with: claw-proxy`);
+Step 3: Start the proxy
+
+  npm start
+
+  That's it. The proxy rotates between your accounts automatically.
+
+---
+Config file: ~/.claw-proxy/config.json
+Bearer token: ${config.bearerToken}
+(Use this as your API key in OpenClaw / other clients)
+`);
 }

@@ -5,7 +5,10 @@ import os from "os";
 
 export interface AccountConfig {
   name: string;
-  configDir: string;
+  /** OAuth token from `claude setup-token` (preferred) */
+  oauthToken?: string;
+  /** Fallback: path to a dedicated config dir with `claude auth login` credentials */
+  configDir?: string;
 }
 
 export interface Config {
@@ -41,15 +44,15 @@ export function loadConfig(): Config {
     };
   }
 
-  // Generate default config with random bearer token
+  // Generate default config with placeholders
   const config: Config = {
     port: 3456,
     host: "127.0.0.1",
     bearerToken: randomBytes(24).toString("hex"),
     accounts: [
-      { name: "account-1", configDir: path.join(os.homedir(), ".claude-account-1") },
-      { name: "account-2", configDir: path.join(os.homedir(), ".claude-account-2") },
-      { name: "account-3", configDir: path.join(os.homedir(), ".claude-account-3") },
+      { name: "account-1", oauthToken: "PASTE_TOKEN_FROM_claude_setup-token" },
+      { name: "account-2", oauthToken: "PASTE_TOKEN_FROM_claude_setup-token" },
+      { name: "account-3", oauthToken: "PASTE_TOKEN_FROM_claude_setup-token" },
     ],
     timeoutMs: 900_000,
     defaultModel: "sonnet",

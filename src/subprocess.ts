@@ -2,7 +2,10 @@ import { spawn, type ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 
 export interface SpawnOptions {
-  configDir: string;
+  /** OAuth token from `claude setup-token` (preferred) */
+  oauthToken?: string;
+  /** Fallback: config dir with `claude auth login` credentials */
+  configDir?: string;
   model: string;
   timeoutMs: number;
   signal?: AbortSignal;
@@ -72,11 +75,17 @@ export class ClaudeProcess extends EventEmitter {
       "1",
     ];
 
+    const env: Record<string, string | undefined> = { ...process.env };
+
+    // Prefer OAuth token (from `claude setup-token`), fall back to config dir
+    if (options.oauthToken) {
+      env.CLAUDE_CODE_OAUTH_TOKEN = options.oauthToken;
+    } else if (options.configDir) {
+      env.CLAUDE_CONFIG_DIR = options.configDir;
+    }
+
     this.proc = spawn("claude", args, {
-      env: {
-        ...process.env,
-        CLAUDE_CONFIG_DIR: options.configDir,
-      },
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
 

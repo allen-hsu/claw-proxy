@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+
+import { loadConfig, getConfigPath } from "./config.js";
+import { createServer } from "./server.js";
+import { checkClaude, runSetup } from "./setup.js";
+
+const config = loadConfig();
+
+// --setup mode
+if (process.argv.includes("--setup")) {
+  runSetup(config);
+  process.exit(0);
+}
+
+// Verify Claude CLI
+const cli = checkClaude();
+if (!cli.ok) {
+  console.error(cli.error);
+  process.exit(1);
+}
+
+// Start server
+const app = createServer(config);
+
+const server = app.listen(config.port, config.host, () => {
+  const endpoint = `http://${config.host}:${config.port}/v1`;
+  const accounts = config.accounts.map((a) => a.name).join(", ");
+  const token = config.bearerToken.slice(0, 16) + "...";
+  console.log(`
+  claw-proxy running
+
+  Endpoint:  ${endpoint}
+  Accounts:  ${accounts}
+  Bearer:    ${token}
+  Config:    ${getConfigPath()}
+
+  Test: curl ${endpoint}/models -H "Authorization: Bearer ${config.bearerToken.slice(0, 8)}..."
+  `);
+});
+
+// Graceful shutdown
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    console.log(`\n[${sig}] Shutting down...`);
+    server.close(() => process.exit(0));
+  });
+}

@@ -35,8 +35,8 @@ export function loadConfig(): Config {
   if (existsSync(CONFIG_FILE)) {
     const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
     return {
-      port: raw.port ?? 3456,
-      host: raw.host ?? "127.0.0.1",
+      port: Number(process.env.PORT) || (raw.port ?? 3456),
+      host: process.env.HOST || (raw.host ?? "127.0.0.1"),
       bearerToken: raw.bearerToken ?? "",
       accounts: raw.accounts ?? [],
       timeoutMs: raw.timeoutMs ?? 900_000,

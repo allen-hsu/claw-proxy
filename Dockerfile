@@ -8,7 +8,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY dist/ dist/
 
-# Config mounted at runtime via volume
+ENV HOST=0.0.0.0
 EXPOSE 3456
 
 CMD ["node", "dist/index.js"]

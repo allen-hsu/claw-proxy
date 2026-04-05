@@ -1,0 +1,14 @@
+services:
+  claw-proxy:
+    build: .
+    ports:
+      - "3456:3456"
+    volumes:
+      - ./data:/root/.claw-proxy:ro
+    networks:
+      - clawhuddle-net
+    restart: unless-stopped
+
+networks:
+  clawhuddle-net:
+    external: true

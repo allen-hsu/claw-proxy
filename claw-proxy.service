@@ -1,0 +1,15 @@
+[Unit]
+Description=Claw Proxy - Claude Max API Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/claw-proxy
+ExecStart=/usr/bin/node /opt/claw-proxy/dist/index.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

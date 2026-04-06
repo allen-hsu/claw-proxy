@@ -14,7 +14,7 @@ import {
 
 const MAX_RETRIES = 3;
 const AUTH_COOLDOWN_MS = 300_000; // 5 minutes
-const RATE_COOLDOWN_MS = 60_000;  // 1 minute
+const RATE_COOLDOWN_MS = 60_000;  // 1 minute (fallback)
 const EXIT_COOLDOWN_MS = 30_000;  // 30 seconds
 
 function isAuthError(text: string): boolean {
@@ -146,6 +146,7 @@ function handleStreamWithRetry(
   const proc = new ClaudeProcess();
   let gotResult = false;
   let fullText = "";
+  let rateLimitResetsAt = 0; // epoch seconds from rate_limit_event
 
   // Client disconnect
   res.on("close", () => {
@@ -158,9 +159,25 @@ function handleStreamWithRetry(
     fullText += text;
   });
 
+  proc.on("rate_limit", (info: { status: string; resetsAt?: number }) => {
+    if (info.resetsAt) rateLimitResetsAt = info.resetsAt;
+    if (info.status === "rejected") {
+      const cooldownMs = rateLimitResetsAt
+        ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
+        : RATE_COOLDOWN_MS;
+      console.log(`[${requestId}] Rate limit rejected on ${account.account.name}, cooldown ${Math.round(cooldownMs / 1000)}s (resets ${new Date(rateLimitResetsAt * 1000).toLocaleTimeString()})`);
+      router.cooldown(account, cooldownMs);
+    }
+  });
+
   proc.on("result", (result: CliResultMessage) => {
     gotResult = true;
     const resultText = result.result || "";
+
+    // Compute rate limit cooldown from resetsAt if available
+    const rateCooldownMs = rateLimitResetsAt
+      ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
+      : RATE_COOLDOWN_MS;
 
     // Check for retryable errors
     if (result.is_error && attempt < MAX_RETRIES - 1) {
@@ -172,8 +189,8 @@ function handleStreamWithRetry(
         return;
       }
       if (isRateLimit(resultText)) {
-        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
-        router.cooldown(account, RATE_COOLDOWN_MS);
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
+        router.cooldown(account, rateCooldownMs);
         router.release(account);
         handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
         return;
@@ -183,7 +200,7 @@ function handleStreamWithRetry(
     // Non-retryable error or last attempt — cooldown and respond
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
-      else if (isRateLimit(resultText)) router.cooldown(account, RATE_COOLDOWN_MS);
+      else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
     }
 
     // Build response
@@ -286,14 +303,30 @@ function handleSyncWithRetry(
   const proc = new ClaudeProcess();
   let fullText = "";
   let gotResult = false;
+  let rateLimitResetsAt = 0;
 
   proc.on("delta", (text: string) => {
     fullText += text;
   });
 
+  proc.on("rate_limit", (info: { status: string; resetsAt?: number }) => {
+    if (info.resetsAt) rateLimitResetsAt = info.resetsAt;
+    if (info.status === "rejected") {
+      const cooldownMs = rateLimitResetsAt
+        ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
+        : RATE_COOLDOWN_MS;
+      console.log(`[${requestId}] Rate limit rejected on ${account.account.name}, cooldown ${Math.round(cooldownMs / 1000)}s`);
+      router.cooldown(account, cooldownMs);
+    }
+  });
+
   proc.on("result", (result: CliResultMessage) => {
     gotResult = true;
     const resultText = result.result || "";
+
+    const rateCooldownMs = rateLimitResetsAt
+      ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
+      : RATE_COOLDOWN_MS;
 
     // Check for retryable errors
     if (result.is_error && attempt < MAX_RETRIES - 1) {
@@ -305,8 +338,8 @@ function handleSyncWithRetry(
         return;
       }
       if (isRateLimit(resultText)) {
-        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
-        router.cooldown(account, RATE_COOLDOWN_MS);
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
+        router.cooldown(account, rateCooldownMs);
         router.release(account);
         handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
         return;
@@ -316,7 +349,7 @@ function handleSyncWithRetry(
     // Non-retryable or last attempt
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
-      else if (isRateLimit(resultText)) router.cooldown(account, RATE_COOLDOWN_MS);
+      else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
       res.status(500).json({
         error: { message: "Claude request failed", type: "server_error" },
       });

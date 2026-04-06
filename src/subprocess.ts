@@ -190,6 +190,11 @@ export class ClaudeProcess extends EventEmitter {
           }
         }
         this.emit("assistant", parsed as CliAssistantMessage);
+      } else if (parsed.type === "rate_limit_event") {
+        const info = parsed.rate_limit_info;
+        if (info) {
+          this.emit("rate_limit", info);
+        }
       } else if (parsed.type === "result") {
         this.emit("result", parsed as CliResultMessage);
       }

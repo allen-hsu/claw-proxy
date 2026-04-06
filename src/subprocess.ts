@@ -96,7 +96,9 @@ export class ClaudeProcess extends EventEmitter {
     // Parse NDJSON from stdout
     this.proc.stdout!.on("data", (chunk: Buffer) => {
       this.resetTimeout(options.timeoutMs);
-      this.buffer += chunk.toString();
+      const text = chunk.toString();
+      console.log(`[Claude stdout] ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
+      this.buffer += text;
       this.parseBuffer();
     });
 
@@ -106,11 +108,13 @@ export class ClaudeProcess extends EventEmitter {
     });
 
     this.proc.on("error", (err) => {
+      console.error(`[Claude] process error: ${err.message}`);
       this.cleanup();
       this.emit("error", err);
     });
 
     this.proc.on("close", (code) => {
+      console.log(`[Claude] process closed with code ${code}`);
       this.cleanup();
       this.emit("close", code);
     });
@@ -169,6 +173,15 @@ export class ClaudeProcess extends EventEmitter {
           this.emit("delta", delta.text);
         }
       } else if (parsed.type === "assistant") {
+        // Extract text from assistant message content as a delta fallback
+        const content = parsed.message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "text" && block.text) {
+              this.emit("delta", block.text);
+            }
+          }
+        }
         this.emit("assistant", parsed as CliAssistantMessage);
       } else if (parsed.type === "result") {
         this.emit("result", parsed as CliResultMessage);

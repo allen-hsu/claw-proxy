@@ -74,7 +74,7 @@ export function createServer(config: Config) {
     }
 
     console.log(
-      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | account=${account.account.name}`
+      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | account=${account.account.name} | messages=${body.messages.length} | prompt_len=${prompt.length}`
     );
 
     if (body.stream) {

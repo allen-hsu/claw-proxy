@@ -56,21 +56,48 @@ curl http://127.0.0.1:3456/v1/chat/completions \
 
 ## Usage with OpenClaw
 
-Add to your `openclaw.json`:
+Add a custom provider to your `openclaw.json`:
 
 ```json
 {
-  "env": {
-    "OPENAI_API_KEY": "<your-bearer-token>",
-    "OPENAI_BASE_URL": "http://localhost:3456/v1"
+  "models": {
+    "providers": {
+      "claw": {
+        "baseUrl": "http://localhost:3456/v1",
+        "apiKey": "<your-bearer-token>",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "claude-opus-4-6",
+            "name": "Claude Opus 4.6",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000000,
+            "maxTokens": 32000
+          },
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000000,
+            "maxTokens": 32000
+          }
+        ]
+      }
+    }
   },
   "agents": {
     "defaults": {
-      "model": { "primary": "openai/claude-sonnet-4" }
+      "model": { "primary": "claw/claude-opus-4-6" }
     }
   }
 }
 ```
+
+The `cost` is set to `0` since requests go through your Claude Max subscription.
 
 ## Usage with ClawHuddle
 

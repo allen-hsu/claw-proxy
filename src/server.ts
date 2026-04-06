@@ -91,7 +91,7 @@ export function createServer(config: Config) {
   });
 
   // Chat completions
-  app.post("/v1/chat/completions", (req: Request, res: Response) => {
+  app.post("/v1/chat/completions", async (req: Request, res: Response) => {
     const body = req.body as OpenAIRequest;
 
     if (!body.messages?.length) {
@@ -110,9 +110,9 @@ export function createServer(config: Config) {
     );
 
     if (body.stream) {
-      handleStreamWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
+      await handleStreamWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
     } else {
-      handleSyncWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
+      await handleSyncWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
     }
   });
 
@@ -126,7 +126,7 @@ export function createServer(config: Config) {
 
 // --- Streaming with retry ---
 
-function handleStreamWithRetry(
+async function handleStreamWithRetry(
   res: Response,
   requestId: string,
   model: string,
@@ -137,7 +137,7 @@ function handleStreamWithRetry(
   sessions: SessionManager,
   attempt: number,
   userId: string
-): void {
+): Promise<void> {
   const account = router.acquire(userId);
   if (!account) {
     res.status(503).json({
@@ -148,6 +148,9 @@ function handleStreamWithRetry(
 
   // Session management: decide resume vs new
   const existingSession = sessions.getSession(userId, account.account.name);
+
+  // Lock session — waits if another request is using it
+  await sessions.lock(userId);
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
@@ -193,6 +196,7 @@ function handleStreamWithRetry(
   res.on("close", () => {
     abort.abort();
     proc.kill();
+    sessions.unlock(userId);
     router.release(account);
   });
 
@@ -226,7 +230,8 @@ function handleStreamWithRetry(
         console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
-        router.release(account);
+        sessions.unlock(userId);
+    router.release(account);
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
@@ -234,7 +239,8 @@ function handleStreamWithRetry(
         console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
-        router.release(account);
+        sessions.unlock(userId);
+    router.release(account);
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
@@ -272,6 +278,7 @@ function handleStreamWithRetry(
 
     res.write("data: [DONE]\n\n");
     res.end();
+    sessions.unlock(userId);
     router.release(account);
   });
 
@@ -282,7 +289,8 @@ function handleStreamWithRetry(
     if (attempt < MAX_RETRIES - 1) {
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
-      router.release(account);
+      sessions.unlock(userId);
+    router.release(account);
       handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
       return;
     }
@@ -294,6 +302,7 @@ function handleStreamWithRetry(
       res.write("data: [DONE]\n\n");
       res.end();
     }
+    sessions.unlock(userId);
     router.release(account);
   });
 
@@ -304,7 +313,8 @@ function handleStreamWithRetry(
         console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
-        router.release(account);
+        sessions.unlock(userId);
+    router.release(account);
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
@@ -314,7 +324,8 @@ function handleStreamWithRetry(
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      router.release(account);
+      sessions.unlock(userId);
+    router.release(account);
     }
   });
 
@@ -331,7 +342,7 @@ function handleStreamWithRetry(
 
 // --- Sync with retry ---
 
-function handleSyncWithRetry(
+async function handleSyncWithRetry(
   res: Response,
   requestId: string,
   model: string,
@@ -342,7 +353,7 @@ function handleSyncWithRetry(
   sessions: SessionManager,
   attempt: number,
   userId: string
-): void {
+): Promise<void> {
   const account = router.acquire(userId);
   if (!account) {
     res.status(503).json({
@@ -353,6 +364,9 @@ function handleSyncWithRetry(
 
   // Session management
   const existingSession = sessions.getSession(userId, account.account.name);
+
+  // Lock session — waits if another request is using it
+  await sessions.lock(userId);
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
@@ -411,7 +425,8 @@ function handleSyncWithRetry(
         console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
-        router.release(account);
+        sessions.unlock(userId);
+    router.release(account);
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
@@ -419,7 +434,8 @@ function handleSyncWithRetry(
         console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
-        router.release(account);
+        sessions.unlock(userId);
+    router.release(account);
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
@@ -438,6 +454,7 @@ function handleSyncWithRetry(
       sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
       res.json(completionResponse(requestId, model, result));
     }
+    sessions.unlock(userId);
     router.release(account);
   });
 
@@ -447,7 +464,8 @@ function handleSyncWithRetry(
     if (attempt < MAX_RETRIES - 1) {
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
-      router.release(account);
+      sessions.unlock(userId);
+    router.release(account);
       handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
       return;
     }
@@ -457,6 +475,7 @@ function handleSyncWithRetry(
         error: { message: "Internal error", type: "server_error" },
       });
     }
+    sessions.unlock(userId);
     router.release(account);
   });
 
@@ -466,7 +485,8 @@ function handleSyncWithRetry(
         console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
-        router.release(account);
+        sessions.unlock(userId);
+    router.release(account);
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
@@ -477,7 +497,8 @@ function handleSyncWithRetry(
           error: { message: `Process exited with code ${code}`, type: "server_error" },
         });
       }
-      router.release(account);
+      sessions.unlock(userId);
+    router.release(account);
     }
   });
 

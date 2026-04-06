@@ -10,6 +10,10 @@ export interface SessionEntry {
   lastMessageCount: number;
   createdAt: number;
   lastUsedAt: number;
+  /** Whether a claude process is currently using this session */
+  busy: boolean;
+  /** Queued requests waiting for this session to become free */
+  queue: Array<{ resolve: () => void }>;
 }
 
 /**
@@ -53,10 +57,49 @@ export class SessionManager {
       lastMessageCount: 0,
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
+      busy: false,
+      queue: [],
     };
 
     this.sessionsByUser.set(userId, session);
     return session;
+  }
+
+  /**
+   * Lock a session before spawning a claude process.
+   * If the session is busy, waits in queue until it's free.
+   */
+  async lock(userId: string): Promise<void> {
+    const session = this.sessionsByUser.get(userId);
+    if (!session) return;
+
+    if (!session.busy) {
+      session.busy = true;
+      return;
+    }
+
+    // Session is busy — wait in queue
+    await new Promise<void>((resolve) => {
+      session.queue.push({ resolve });
+    });
+    session.busy = true;
+  }
+
+  /**
+   * Unlock a session after the claude process finishes.
+   * Wakes up the next queued request if any.
+   */
+  unlock(userId: string): void {
+    const session = this.sessionsByUser.get(userId);
+    if (!session) return;
+
+    const next = session.queue.shift();
+    if (next) {
+      // Hand off to next waiter (keep busy=true)
+      next.resolve();
+    } else {
+      session.busy = false;
+    }
   }
 
   /** Update session after a successful response. */
@@ -83,7 +126,7 @@ export class SessionManager {
     session.lastUsedAt = Date.now();
   }
 
-  /** Invalidate and remove a session. */
+  /** Invalidate and remove a session. Wakes queued waiters (they'll create new sessions). */
   invalidateSession(userId: string): void {
     const session = this.sessionsByUser.get(userId);
     if (!session) return;
@@ -91,6 +134,11 @@ export class SessionManager {
     // Clean up tool_call_id mappings
     for (const id of session.toolCallIds) {
       this.toolCallIdToUser.delete(id);
+    }
+
+    // Wake all queued waiters — they'll find no session and create a new one
+    for (const waiter of session.queue) {
+      waiter.resolve();
     }
 
     this.sessionsByUser.delete(userId);

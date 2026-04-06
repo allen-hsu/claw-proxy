@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import express, { type Request, type Response } from "express";
 import type { Config } from "./config.js";
 import { AccountRouter, type AccountState } from "./router.js";
@@ -40,6 +41,52 @@ function isRateLimit(text: string): boolean {
 
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
 const SESSION_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+const SESSION_HEADER_CANDIDATES = [
+  "x-session-id",
+  "x-conversation-id",
+  "x-thread-id",
+  "openai-conversation-id",
+] as const;
+
+function firstTextBlock(msg: OpenAIMessage): string {
+  if (typeof msg.content === "string") return msg.content;
+  if (!Array.isArray(msg.content)) return "";
+  return msg.content
+    .filter((part) => part.type === "text" && part.text)
+    .map((part) => part.text!)
+    .join("\n");
+}
+
+function makeConversationFingerprint(messages: OpenAIMessage[]): string {
+  const seedParts: string[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "tool") continue;
+    const text = firstTextBlock(msg).trim();
+    if (!text) continue;
+    seedParts.push(`${msg.role}:${text.slice(0, 500)}`);
+    if (seedParts.length >= 3) break;
+  }
+
+  const seed = seedParts.join("\n---\n");
+  if (!seed) return "anonymous";
+
+  return createHash("sha1").update(seed).digest("hex").slice(0, 16);
+}
+
+export function resolveSessionKey(req: Request, body: OpenAIRequest): string {
+  const explicitUser = typeof body.user === "string" ? body.user.trim() : "";
+  if (explicitUser) return `user:${explicitUser}`;
+
+  for (const header of SESSION_HEADER_CANDIDATES) {
+    const value = req.header(header)?.trim();
+    if (value) return `header:${header}:${value}`;
+  }
+
+  const ip = req.ip || "unknown";
+  const fingerprint = makeConversationFingerprint(body.messages ?? []);
+  return `ip:${ip}:fp:${fingerprint}`;
+}
 
 export function createServer(config: Config) {
   const app = express();
@@ -114,7 +161,7 @@ export function createServer(config: Config) {
 
     const requestId = makeRequestId();
     const model = resolveModel(body.model, config.defaultModel);
-    const userId = body.user || req.ip || "default";
+    const userId = resolveSessionKey(req, body);
 
     console.log(
       `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | messages=${body.messages.length}`

@@ -109,6 +109,8 @@ API Key:   <your-bearer-token>
 Model:     claude-sonnet-4
 ```
 
+For best prompt-cache reuse, send a stable conversation identifier in either the OpenAI `user` field or a header like `X-Session-Id`. If neither is provided, the proxy falls back to an IP + conversation fingerprint heuristic.
+
 ## Available Models
 
 | Model ID | Maps To |

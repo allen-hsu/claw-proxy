@@ -11,7 +11,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch & node --watch dist/index.js",
-    "test": "tsc && node dist/session.test.js",
+    "test": "tsc && node dist/session.test.js && node dist/server_identity.test.js",
     "setup": "node dist/index.js --setup"
   },
   "dependencies": {

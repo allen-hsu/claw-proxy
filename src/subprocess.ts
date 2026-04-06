@@ -111,6 +111,9 @@ export class ClaudeProcess extends EventEmitter {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    // Suppress EPIPE if process dies before we finish writing
+    this.proc.stdin!.on("error", () => {});
+
     // Feed prompt via stdin
     this.proc.stdin!.write(prompt);
     this.proc.stdin!.end();

@@ -220,12 +220,16 @@ async function handleStreamWithRetry(
     router.release(account);
   }
 
-  // Client disconnect
+  // Client disconnect — only invalidate if we didn't finish normally
+  // (res.end() also fires "close", but cleanup() will have set done=true by then)
   res.on("close", () => {
-    abort.abort();
-    proc.kill();
-    sessions.invalidateSession(userId);
-    cleanup();
+    if (!done) {
+      // Premature disconnect — kill process and invalidate session
+      abort.abort();
+      proc.kill();
+      sessions.invalidateSession(userId);
+      cleanup();
+    }
   });
 
   proc.on("delta", (text: string) => {
@@ -430,12 +434,16 @@ async function handleSyncWithRetry(
     router.release(account);
   }
 
-  // Client disconnect
+  // Client disconnect — only invalidate if we didn't finish normally
+  // (res.end() also fires "close", but cleanup() will have set done=true by then)
   res.on("close", () => {
-    abort.abort();
-    proc.kill();
-    sessions.invalidateSession(userId);
-    cleanup();
+    if (!done) {
+      // Premature disconnect — kill process and invalidate session
+      abort.abort();
+      proc.kill();
+      sessions.invalidateSession(userId);
+      cleanup();
+    }
   });
 
   proc.on("delta", (text: string) => {

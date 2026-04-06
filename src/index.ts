@@ -55,6 +55,15 @@ const server = app.listen(config.port, config.host, () => {
   `);
 });
 
+// Prevent process exit on unexpected errors
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err.message);
+  console.error(err.stack);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] Unhandled rejection:", reason);
+});
+
 // Graceful shutdown
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {

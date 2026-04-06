@@ -75,7 +75,6 @@ export class ClaudeProcess extends EventEmitter {
       "1",
       "--tools",
       "",
-      "--dangerously-skip-permissions",
       "--mcp-config",
       '{"mcpServers":{}}',
       "--strict-mcp-config",

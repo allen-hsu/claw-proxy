@@ -7,15 +7,14 @@ export interface AccountState {
 }
 
 /**
- * Account rotator with sticky sessions.
+ * Fill-first account router with sticky sessions.
  *
- * First request from a user gets assigned an account (round-robin).
- * Subsequent requests from the same user stick to the same account.
- * If the sticky account is in cooldown, falls back to the next available one.
+ * Uses the first available account until it hits rate limits (cooldown),
+ * then moves to the next. Maximizes prompt cache reuse per account.
+ * Sticky bindings keep the same conversation on the same account.
  */
 export class AccountRouter {
   private states: AccountState[];
-  private nextIndex = 0;
   /** Maps user/session ID → account name + timestamp for sticky routing */
   private sticky = new Map<string, { name: string; at: number }>();
   private static readonly STICKY_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -29,7 +28,7 @@ export class AccountRouter {
     }));
   }
 
-  /** Pick an account for the given user. Sticky if possible, round-robin otherwise. */
+  /** Pick an account for the given user. Sticky first, then fill-first (not round-robin). */
   acquire(userId?: string): AccountState | null {
     const now = Date.now();
 
@@ -43,22 +42,18 @@ export class AccountRouter {
         const state = this.states.find((s) => s.account.name === stickyEntry.name);
         if (state && state.cooldownUntil <= now) {
           state.activeRequests++;
-          stickyEntry.at = now; // refresh TTL
+          stickyEntry.at = now;
           return state;
         }
-        // Sticky account in cooldown — fall through to round-robin
+        // Sticky account in cooldown — fall through to fill-first
       }
     }
 
-    // Round-robin: pick next available
-    const len = this.states.length;
-    for (let i = 0; i < len; i++) {
-      const idx = (this.nextIndex + i) % len;
-      const state = this.states[idx];
+    // Fill-first: always pick the first non-cooldown account
+    // Only moves to the next when the current one is rate-limited
+    for (const state of this.states) {
       if (state.cooldownUntil <= now) {
-        this.nextIndex = (idx + 1) % len;
         state.activeRequests++;
-        // Bind this user to this account
         if (userId) {
           this.sticky.set(userId, { name: state.account.name, at: now });
         }
@@ -66,7 +61,7 @@ export class AccountRouter {
       }
     }
 
-    // All in cooldown — return null, let caller handle (503 or retry later)
+    // All in cooldown — return null
     return null;
   }
 

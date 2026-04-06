@@ -224,6 +224,7 @@ async function handleStreamWithRetry(
   res.on("close", () => {
     abort.abort();
     proc.kill();
+    sessions.invalidateSession(userId);
     cleanup();
   });
 
@@ -334,7 +335,10 @@ async function handleStreamWithRetry(
         });
         return;
       }
-      if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
+      if (code !== 0) {
+        sessions.invalidateSession(userId);
+        router.cooldown(account, EXIT_COOLDOWN_MS);
+      }
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
@@ -430,6 +434,7 @@ async function handleSyncWithRetry(
   res.on("close", () => {
     abort.abort();
     proc.kill();
+    sessions.invalidateSession(userId);
     cleanup();
   });
 
@@ -526,7 +531,10 @@ async function handleSyncWithRetry(
         });
         return;
       }
-      if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
+      if (code !== 0) {
+        sessions.invalidateSession(userId);
+        router.cooldown(account, EXIT_COOLDOWN_MS);
+      }
       if (!res.headersSent) {
         res.status(500).json({ error: { message: `Process exited with code ${code}`, type: "server_error" } });
       }

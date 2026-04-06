@@ -37,22 +37,15 @@ export class SessionManager {
    * Creates a new session if none exists. Waits if the session is busy.
    * Returns a handle with session info and a one-shot release().
    */
-  async acquireSession(userId: string, accountName: string): Promise<SessionHandle> {
+  async acquireSession(userId: string): Promise<SessionHandle> {
     let session = this.sessionsByUser.get(userId);
-
-    // If session exists but bound to a different account, invalidate it
-    if (session && session.accountName !== accountName) {
-      this.invalidateSession(userId);
-      session = undefined;
-    }
-
     let isResume = false;
 
     if (!session) {
       // Create new session — automatically locked (busy=true)
       session = {
         sessionId: uuid(),
-        accountName,
+        accountName: "",
         toolCallIds: new Set(),
         lastMessageCount: 0,
         createdAt: Date.now(),
@@ -77,7 +70,7 @@ export class SessionManager {
         // Was invalidated — create fresh
         session = {
           sessionId: uuid(),
-          accountName,
+          accountName: "",
           toolCallIds: new Set(),
           lastMessageCount: 0,
           createdAt: Date.now(),

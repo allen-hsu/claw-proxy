@@ -150,7 +150,7 @@ async function handleStreamWithRetry(
   userId: string
 ): Promise<void> {
   // 1. Acquire session lock first (may wait if session is busy)
-  const handle = await sessions.acquireSession(userId, "pending");
+  let handle = await sessions.acquireSession(userId);
 
   // 2. Now acquire account (after lock, so activeRequests is accurate)
   const maybeAccount = router.acquire(userId);
@@ -165,15 +165,22 @@ async function handleStreamWithRetry(
   }
   const account = maybeAccount;
 
-  // Update session's account binding if it changed
+  // If account changed (e.g. after cooldown re-route), session can't be resumed
+  const accountChanged = handle.session.accountName !== "" && handle.session.accountName !== account.account.name;
+  if (accountChanged) {
+    // Invalidate old session, create fresh one for this account
+    sessions.invalidateSession(userId);
+    handle = await sessions.acquireSession(userId);
+  }
   handle.session.accountName = account.account.name;
 
   // Decide resume vs new
+  const canResume = handle.isResume && !accountChanged && handle.session.lastMessageCount < messages.length;
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
-  if (handle.isResume && handle.session.lastMessageCount < messages.length) {
+  if (canResume) {
     spawnResumeId = handle.session.sessionId;
     prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
@@ -349,7 +356,7 @@ async function handleSyncWithRetry(
   attempt: number,
   userId: string
 ): Promise<void> {
-  const handle = await sessions.acquireSession(userId, "pending");
+  let handle = await sessions.acquireSession(userId);
 
   const maybeAccount = router.acquire(userId);
   if (!maybeAccount) {
@@ -363,13 +370,19 @@ async function handleSyncWithRetry(
   }
   const account = maybeAccount;
 
+  const accountChanged = handle.session.accountName !== "" && handle.session.accountName !== account.account.name;
+  if (accountChanged) {
+    sessions.invalidateSession(userId);
+    handle = await sessions.acquireSession(userId);
+  }
   handle.session.accountName = account.account.name;
 
+  const canResume = handle.isResume && !accountChanged && handle.session.lastMessageCount < messages.length;
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
-  if (handle.isResume && handle.session.lastMessageCount < messages.length) {
+  if (canResume) {
     spawnResumeId = handle.session.sessionId;
     prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {

@@ -78,6 +78,8 @@ export class ClaudeProcess extends EventEmitter {
       "--mcp-config",
       '{"mcpServers":{}}',
       "--strict-mcp-config",
+      "--system-prompt",
+      "You are a helpful assistant. Respond directly to the user's request.",
     ];
 
     const env: Record<string, string | undefined> = { ...process.env };

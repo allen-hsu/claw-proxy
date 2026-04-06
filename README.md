@@ -99,55 +99,6 @@ Add a custom provider to your `openclaw.json`:
 
 The `cost` is set to `0` since requests go through your Claude Max subscription.
 
-## Usage with ClawHuddle
-
-claw-proxy runs as a standalone Docker service and joins ClawHuddle's network.
-
-**1. Start ClawHuddle first** (creates the `clawhuddle-net` network):
-
-```bash
-cd clawhuddle
-docker compose up -d
-```
-
-**2. Start claw-proxy** (joins the same network):
-
-```bash
-cd claw-proxy
-
-mkdir -p data
-cat > data/config.json << 'EOF'
-{
-  "port": 3456,
-  "host": "0.0.0.0",
-  "bearerToken": "<pick-any-random-string>",
-  "accounts": [
-    { "name": "account-1", "oauthToken": "<token-A>" },
-    { "name": "account-2", "oauthToken": "<token-B>" },
-    { "name": "account-3", "oauthToken": "<token-C>" }
-  ],
-  "timeoutMs": 900000,
-  "defaultModel": "sonnet"
-}
-EOF
-
-docker compose up -d --build
-```
-
-**3. Configure ClawHuddle** `.env`:
-
-```
-OPENAI_BASE_URL=http://claw-proxy:3456/v1
-```
-
-**4. In ClawHuddle UI:**
-
-- Add an OpenAI provider key → paste the `bearerToken` from config.json
-- Select model: **Claude Sonnet 4 (via Proxy)**
-- Redeploy gateways
-
-ClawHuddle gateway containers reach claw-proxy via Docker DNS (`claw-proxy:3456`).
-
 ## Usage with Any OpenAI-Compatible Client
 
 Any tool that supports custom OpenAI endpoints works (Continue.dev, TypingMind, etc.):
@@ -182,15 +133,15 @@ curl http://127.0.0.1:3456/health -H "Authorization: Bearer <token>"
 
 ## Deployment
 
-### Docker (recommended for servers)
+### Docker
 
 ```bash
+mkdir -p data
+# Create data/config.json with your tokens (see Setup Accounts above)
 docker compose up -d --build
 ```
 
-The `docker-compose.yml` publishes port 3456 and joins `clawhuddle-net` (if it exists).
-
-Config is mounted from `./data/config.json`.
+Config is mounted from `./data/config.json`. Set `host` to `"0.0.0.0"` in config for Docker.
 
 ### systemd (Linux)
 

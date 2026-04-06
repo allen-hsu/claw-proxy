@@ -56,19 +56,11 @@ docker compose up -d --build
 
 - Config: `./data/config.json` mounted read-only to `/root/.claw-proxy/`
 - Dockerfile sets `HOST=0.0.0.0` so the container accepts external connections
-- Joins `clawhuddle-net` external network for ClawHuddle integration
+- `docker-compose.yml` joins `clawhuddle-net` as an external network (if present)
 
-## Integration Points
+## Integration
 
-### OpenClaw
-
-Uses `env.OPENAI_BASE_URL` + `env.OPENAI_API_KEY` in `openclaw.json` to route `openai/*` models to claw-proxy.
-
-### ClawHuddle
-
-- `OPENAI_BASE_URL` env var in ClawHuddle's `.env` → written into every gateway's `openclaw.json` as `env.OPENAI_BASE_URL`
-- OpenAI provider key in ClawHuddle UI = claw-proxy's `bearerToken`
-- Gateway containers reach claw-proxy via Docker DNS (`http://claw-proxy:3456/v1`)
+Any OpenAI-compatible client can use claw-proxy by setting a custom base URL and using the bearer token as an API key. For OpenClaw specifically, register a custom provider in `openclaw.json` with `api: "openai-completions"` pointing to claw-proxy's `/v1` endpoint.
 
 ## Testing
 

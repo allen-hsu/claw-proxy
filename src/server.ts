@@ -2,10 +2,14 @@ import express, { type Request, type Response } from "express";
 import type { Config } from "./config.js";
 import { AccountRouter, type AccountState } from "./router.js";
 import { ClaudeProcess, type CliResultMessage } from "./subprocess.js";
+import { SessionManager } from "./session.js";
 import {
   type OpenAIRequest,
+  type OpenAIMessage,
+  type OpenAIToolDef,
   resolveModel,
   messagesToPrompt,
+  extractNewMessages,
   makeRequestId,
   streamChunk,
   completionResponse,
@@ -34,9 +38,21 @@ function isRateLimit(text: string): boolean {
   return lower.includes("rate") || lower.includes("limit") || lower.includes("overloaded");
 }
 
+const SESSION_CLEANUP_INTERVAL_MS = 60_000;
+const SESSION_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
 export function createServer(config: Config) {
   const app = express();
   const router = new AccountRouter(config.accounts);
+  const sessions = new SessionManager();
+
+  // Periodic session cleanup
+  setInterval(() => {
+    const result = sessions.cleanup(SESSION_MAX_AGE_MS);
+    if (result.deleted > 0) {
+      console.log(`[Sessions] Cleaned up ${result.deleted} expired sessions, ${result.remaining} remaining`);
+    }
+  }, SESSION_CLEANUP_INTERVAL_MS);
 
   // Middleware
   app.use(express.json({ limit: "4mb" }));
@@ -57,6 +73,7 @@ export function createServer(config: Config) {
     res.json({
       status: "ok",
       accounts: router.status(),
+      sessions: sessions.status(),
       timestamp: new Date().toISOString(),
     });
   });
@@ -86,19 +103,16 @@ export function createServer(config: Config) {
 
     const requestId = makeRequestId();
     const model = resolveModel(body.model, config.defaultModel);
-    const prompt = messagesToPrompt(body.messages, body.tools);
-
-    // Use "user" field from OpenAI request for sticky routing
     const userId = body.user || req.ip || "default";
 
     console.log(
-      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | messages=${body.messages.length} | prompt_len=${prompt.length}`
+      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | messages=${body.messages.length}`
     );
 
     if (body.stream) {
-      handleStreamWithRetry(res, requestId, model, prompt, config, router, 0, userId);
+      handleStreamWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
     } else {
-      handleSyncWithRetry(res, requestId, model, prompt, config, router, 0, userId);
+      handleSyncWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
     }
   });
 
@@ -116,11 +130,13 @@ function handleStreamWithRetry(
   res: Response,
   requestId: string,
   model: string,
-  prompt: string,
+  messages: OpenAIMessage[],
+  tools: OpenAIToolDef[] | undefined,
   config: Config,
   router: AccountRouter,
+  sessions: SessionManager,
   attempt: number,
-  userId?: string
+  userId: string
 ): void {
   const account = router.acquire(userId);
   if (!account) {
@@ -130,9 +146,34 @@ function handleStreamWithRetry(
     return;
   }
 
-  console.log(
-    `[${requestId}] attempt=${attempt + 1} | account=${account.account.name}`
-  );
+  // Session management: decide resume vs new
+  const existingSession = sessions.getSession(userId, account.account.name);
+  let prompt: string;
+  let spawnSessionId: string | undefined;
+  let spawnResumeId: string | undefined;
+
+  if (existingSession && existingSession.lastMessageCount > 0 && existingSession.lastMessageCount < messages.length) {
+    // Resume existing session — only send new messages
+    spawnResumeId = existingSession.sessionId;
+    prompt = extractNewMessages(messages, existingSession.lastMessageCount);
+    if (!prompt) {
+      // Fallback to full history if delta is empty
+      spawnResumeId = undefined;
+      spawnSessionId = existingSession.sessionId;
+      prompt = messagesToPrompt(messages, tools);
+    }
+    console.log(
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${existingSession.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+    );
+  } else {
+    // New session or first request
+    const newSession = existingSession ?? sessions.createSession(userId, account.account.name);
+    spawnSessionId = newSession.sessionId;
+    prompt = messagesToPrompt(messages, tools);
+    console.log(
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${newSession.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
+    );
+  }
 
   // Only set headers on first attempt
   if (attempt === 0) {
@@ -183,16 +224,18 @@ function handleStreamWithRetry(
     if (result.is_error && attempt < MAX_RETRIES - 1) {
       if (isAuthError(resultText)) {
         console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
+        sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         router.release(account);
-        handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
       if (isRateLimit(resultText)) {
         console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
+        sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         router.release(account);
-        handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
     }
@@ -206,6 +249,12 @@ function handleStreamWithRetry(
     // Build response
     const responseText = fullText || resultText;
     const { cleanText, toolCalls } = parseToolCalls(responseText);
+
+    // Update session with tool_call_ids and message count
+    if (!result.is_error) {
+      const tcIds = toolCalls.map((tc) => tc.id);
+      sessions.updateSession(userId, tcIds, messages.length);
+    }
 
     if (toolCalls.length > 0) {
       console.log(
@@ -231,9 +280,10 @@ function handleStreamWithRetry(
 
     // Retry on process errors (e.g. CLI crash)
     if (attempt < MAX_RETRIES - 1) {
+      sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       router.release(account);
-      handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+      handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
       return;
     }
 
@@ -252,9 +302,10 @@ function handleStreamWithRetry(
       // Non-zero exit without a result — retry
       if (code !== 0 && attempt < MAX_RETRIES - 1) {
         console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+        sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
         router.release(account);
-        handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
 
@@ -273,6 +324,8 @@ function handleStreamWithRetry(
     model,
     timeoutMs: config.timeoutMs,
     signal: abort.signal,
+    sessionId: spawnSessionId,
+    resumeId: spawnResumeId,
   });
 }
 
@@ -282,11 +335,13 @@ function handleSyncWithRetry(
   res: Response,
   requestId: string,
   model: string,
-  prompt: string,
+  messages: OpenAIMessage[],
+  tools: OpenAIToolDef[] | undefined,
   config: Config,
   router: AccountRouter,
+  sessions: SessionManager,
   attempt: number,
-  userId?: string
+  userId: string
 ): void {
   const account = router.acquire(userId);
   if (!account) {
@@ -296,9 +351,31 @@ function handleSyncWithRetry(
     return;
   }
 
-  console.log(
-    `[${requestId}] attempt=${attempt + 1} | account=${account.account.name}`
-  );
+  // Session management
+  const existingSession = sessions.getSession(userId, account.account.name);
+  let prompt: string;
+  let spawnSessionId: string | undefined;
+  let spawnResumeId: string | undefined;
+
+  if (existingSession && existingSession.lastMessageCount > 0 && existingSession.lastMessageCount < messages.length) {
+    spawnResumeId = existingSession.sessionId;
+    prompt = extractNewMessages(messages, existingSession.lastMessageCount);
+    if (!prompt) {
+      spawnResumeId = undefined;
+      spawnSessionId = existingSession.sessionId;
+      prompt = messagesToPrompt(messages, tools);
+    }
+    console.log(
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${existingSession.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+    );
+  } else {
+    const newSession = existingSession ?? sessions.createSession(userId, account.account.name);
+    spawnSessionId = newSession.sessionId;
+    prompt = messagesToPrompt(messages, tools);
+    console.log(
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${newSession.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
+    );
+  }
 
   const proc = new ClaudeProcess();
   let fullText = "";
@@ -332,16 +409,18 @@ function handleSyncWithRetry(
     if (result.is_error && attempt < MAX_RETRIES - 1) {
       if (isAuthError(resultText)) {
         console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
+        sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         router.release(account);
-        handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
       if (isRateLimit(resultText)) {
         console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
+        sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         router.release(account);
-        handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
     }
@@ -354,6 +433,9 @@ function handleSyncWithRetry(
         error: { message: "Claude request failed", type: "server_error" },
       });
     } else {
+      // Update session
+      const { toolCalls } = parseToolCalls(result.result ?? "");
+      sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
       res.json(completionResponse(requestId, model, result));
     }
     router.release(account);
@@ -363,9 +445,10 @@ function handleSyncWithRetry(
     console.error(`[${requestId}] Error: ${err.message}`);
 
     if (attempt < MAX_RETRIES - 1) {
+      sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       router.release(account);
-      handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+      handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
       return;
     }
 
@@ -381,9 +464,10 @@ function handleSyncWithRetry(
     if (!gotResult) {
       if (code !== 0 && attempt < MAX_RETRIES - 1) {
         console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+        sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
         router.release(account);
-        handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
 
@@ -402,5 +486,7 @@ function handleSyncWithRetry(
     configDir: account.account.configDir,
     model,
     timeoutMs: config.timeoutMs,
+    sessionId: spawnSessionId,
+    resumeId: spawnResumeId,
   });
 }

@@ -170,6 +170,63 @@ export function messagesToPrompt(
   return allParts.join("\n\n");
 }
 
+// --- Extract new messages for --resume mode ---
+
+/**
+ * Extract only new messages since the last session update.
+ * Used with --resume to avoid re-sending the full conversation history.
+ */
+export function extractNewMessages(
+  messages: OpenAIMessage[],
+  lastMessageCount: number
+): string {
+  const newMessages = messages.slice(lastMessageCount);
+  if (newMessages.length === 0) return "";
+
+  const parts: string[] = [];
+
+  for (const msg of newMessages) {
+    const text = extractText(msg.content);
+
+    switch (msg.role) {
+      case "user":
+        if (text) parts.push(`User: ${text}`);
+        break;
+      case "assistant": {
+        const aParts: string[] = [];
+        if (text) aParts.push(text);
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            const fn = tc.function;
+            aParts.push(
+              `<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || "{}"}}\n</tool_call>`
+            );
+          }
+        }
+        if (aParts.length > 0) {
+          parts.push(
+            `<previous_response>\n${aParts.join("\n")}\n</previous_response>`
+          );
+        }
+        break;
+      }
+      case "tool": {
+        const toolName = msg.name || "";
+        const toolId = msg.tool_call_id || "";
+        if (text) {
+          parts.push(
+            `<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`
+          );
+        }
+        break;
+      }
+      // Skip system/developer — session already has them
+    }
+  }
+
+  return parts.join("\n\n");
+}
+
 // --- Parse <tool_call> blocks from Claude's response ---
 
 export interface ParsedToolCall {

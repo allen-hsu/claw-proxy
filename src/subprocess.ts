@@ -9,6 +9,10 @@ export interface SpawnOptions {
   model: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  /** Create/use a named session (first request) */
+  sessionId?: string;
+  /** Resume an existing session (subsequent requests) */
+  resumeId?: string;
 }
 
 export interface CliAssistantMessage {
@@ -63,7 +67,16 @@ export class ClaudeProcess extends EventEmitter {
   private buffer = "";
 
   start(prompt: string, options: SpawnOptions): void {
-    const args = [
+    const args: string[] = [];
+
+    // Session management: --resume or --session-id
+    if (options.resumeId) {
+      args.push("--resume", options.resumeId);
+    } else if (options.sessionId) {
+      args.push("--session-id", options.sessionId);
+    }
+
+    args.push(
       "--print",
       "-",
       "--output-format",
@@ -80,7 +93,7 @@ export class ClaudeProcess extends EventEmitter {
       "--strict-mcp-config",
       "--system-prompt",
       "",
-    ];
+    );
 
     const env: Record<string, string | undefined> = { ...process.env };
 
@@ -196,6 +209,18 @@ export class ClaudeProcess extends EventEmitter {
           this.emit("rate_limit", info);
         }
       } else if (parsed.type === "result") {
+        // Log usage details including cache stats
+        const u = parsed.usage;
+        if (u) {
+          const cacheCreate = u.cache_creation_input_tokens ?? 0;
+          const cacheRead = u.cache_read_input_tokens ?? 0;
+          const input = u.input_tokens ?? 0;
+          const output = u.output_tokens ?? 0;
+          const cachePercent = input > 0 ? Math.round((cacheRead / (input + cacheRead + cacheCreate)) * 100) : 0;
+          console.log(
+            `[Claude usage] input=${input} output=${output} cache_create=${cacheCreate} cache_read=${cacheRead} (${cachePercent}% cached) duration=${parsed.duration_ms}ms`
+          );
+        }
         this.emit("result", parsed as CliResultMessage);
       }
     }

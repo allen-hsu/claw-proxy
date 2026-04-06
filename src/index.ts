@@ -28,8 +28,10 @@ if (!config.accounts.length) {
 
 // Validate each account has credentials
 for (const acct of config.accounts) {
-  if (!acct.oauthToken && !acct.configDir) {
-    console.error(`Error: Account "${acct.name}" has neither oauthToken nor configDir`);
+  const token = acct.oauthToken ?? "";
+  const isPlaceholder = token.startsWith("PASTE_") || token === "";
+  if (isPlaceholder && !acct.configDir) {
+    console.error(`Error: Account "${acct.name}" is not configured. Run 'claude setup-token' and paste the token into ${getConfigPath()}`);
     process.exit(1);
   }
 }

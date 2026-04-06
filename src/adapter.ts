@@ -3,9 +3,16 @@ import type { CliResultMessage } from "./subprocess.js";
 
 // --- Request: OpenAI -> Claude CLI prompt ---
 
+export interface OpenAIContentPart {
+  type: string;
+  text?: string;
+  /** OpenAI vision format */
+  image_url?: { url: string; detail?: string };
+}
+
 export interface OpenAIMessage {
   role: "system" | "developer" | "user" | "assistant" | "tool";
-  content: string | Array<{ type: string; text?: string }> | null;
+  content: string | OpenAIContentPart[] | null;
   tool_calls?: Array<{
     id: string;
     type: "function";
@@ -59,6 +66,134 @@ function extractText(content: OpenAIMessage["content"]): string {
     .filter((p) => p.type === "text" && p.text)
     .map((p) => p.text!)
     .join("\n");
+}
+
+/** Check if any message contains image content. */
+export function hasImageContent(messages: OpenAIMessage[]): boolean {
+  return messages.some((msg) => {
+    if (!Array.isArray(msg.content)) return false;
+    return msg.content.some(
+      (p) => p.type === "image_url" && p.image_url?.url
+    );
+  });
+}
+
+/** Convert an OpenAI image_url part to Anthropic image content block. */
+function convertImagePart(part: OpenAIContentPart): object | null {
+  const url = part.image_url?.url;
+  if (!url) return null;
+
+  // data:image/jpeg;base64,xxxxx
+  const match = url.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+  if (match) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: match[1],
+        data: match[2],
+      },
+    };
+  }
+
+  // URL-based images — Claude API supports source.type="url" too
+  return {
+    type: "image",
+    source: {
+      type: "url",
+      url,
+    },
+  };
+}
+
+/**
+ * Convert OpenAI messages to Claude stream-json input format.
+ * Used when messages contain images (multimodal).
+ * Returns newline-delimited JSON strings to write to stdin.
+ */
+export function messagesToStreamJson(
+  messages: OpenAIMessage[],
+  tools?: OpenAIToolDef[]
+): string {
+  const lines: string[] = [];
+
+  // Collect system prompt
+  const systemParts: string[] = [];
+  for (const msg of messages) {
+    if (msg.role === "system" || msg.role === "developer") {
+      const text = extractText(msg.content);
+      if (text) systemParts.push(text);
+    }
+  }
+  const toolInstructions = buildToolInstructions(tools ?? []);
+  const systemPrompt = systemParts.join("\n\n") + toolInstructions;
+
+  // Build a single user message with the full conversation context
+  // (stream-json only supports user messages as input)
+  const contentBlocks: object[] = [];
+
+  // Add system prompt as text
+  if (systemPrompt) {
+    contentBlocks.push({ type: "text", text: `<system>\n${systemPrompt}\n</system>\n` });
+  }
+
+  for (const msg of messages) {
+    if (msg.role === "system" || msg.role === "developer") continue;
+
+    if (msg.role === "user") {
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === "text" && part.text) {
+            contentBlocks.push({ type: "text", text: `User: ${part.text}` });
+          } else if (part.type === "image_url") {
+            const imgBlock = convertImagePart(part);
+            if (imgBlock) contentBlocks.push(imgBlock);
+          }
+        }
+      } else if (typeof msg.content === "string" && msg.content) {
+        contentBlocks.push({ type: "text", text: `User: ${msg.content}` });
+      }
+    } else if (msg.role === "assistant") {
+      const text = extractText(msg.content);
+      const parts: string[] = [];
+      if (text) parts.push(text);
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          const fn = tc.function;
+          parts.push(
+            `<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || "{}"}}\n</tool_call>`
+          );
+        }
+      }
+      if (parts.length > 0) {
+        contentBlocks.push({
+          type: "text",
+          text: `<previous_response>\n${parts.join("\n")}\n</previous_response>`,
+        });
+      }
+    } else if (msg.role === "tool") {
+      const toolName = msg.name || "";
+      const toolId = msg.tool_call_id || "";
+      const text = extractText(msg.content);
+      if (text) {
+        contentBlocks.push({
+          type: "text",
+          text: `<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`,
+        });
+      }
+    }
+  }
+
+  const userMessage = {
+    type: "user",
+    message: {
+      role: "user",
+      content: contentBlocks,
+    },
+  };
+  lines.push(JSON.stringify(userMessage));
+
+  return lines.join("\n") + "\n";
 }
 
 // --- Gateway-internal tools that should not be listed ---

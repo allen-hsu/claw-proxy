@@ -16,8 +16,10 @@ export interface AccountState {
 export class AccountRouter {
   private states: AccountState[];
   private nextIndex = 0;
-  /** Maps user/session ID → account name for sticky routing */
-  private sticky = new Map<string, string>();
+  /** Maps user/session ID → account name + timestamp for sticky routing */
+  private sticky = new Map<string, { name: string; at: number }>();
+  private static readonly STICKY_TTL_MS = 30 * 60 * 1000; // 30 minutes
+  private static readonly STICKY_MAX_SIZE = 1000;
 
   constructor(accounts: AccountConfig[]) {
     this.states = accounts.map((account) => ({
@@ -31,13 +33,17 @@ export class AccountRouter {
   acquire(userId?: string): AccountState | null {
     const now = Date.now();
 
+    // Prune expired sticky entries
+    this.pruneSticky(now);
+
     // Try sticky account first
     if (userId) {
-      const stickyName = this.sticky.get(userId);
-      if (stickyName) {
-        const state = this.states.find((s) => s.account.name === stickyName);
+      const stickyEntry = this.sticky.get(userId);
+      if (stickyEntry) {
+        const state = this.states.find((s) => s.account.name === stickyEntry.name);
         if (state && state.cooldownUntil <= now) {
           state.activeRequests++;
+          stickyEntry.at = now; // refresh TTL
           return state;
         }
         // Sticky account in cooldown — fall through to round-robin
@@ -54,7 +60,7 @@ export class AccountRouter {
         state.activeRequests++;
         // Bind this user to this account
         if (userId) {
-          this.sticky.set(userId, state.account.name);
+          this.sticky.set(userId, { name: state.account.name, at: now });
         }
         return state;
       }
@@ -62,6 +68,24 @@ export class AccountRouter {
 
     // All in cooldown — return null, let caller handle (503 or retry later)
     return null;
+  }
+
+  /** Remove sticky entries older than TTL or enforce max size. */
+  private pruneSticky(now: number): void {
+    // Remove expired entries
+    for (const [userId, entry] of this.sticky) {
+      if (now - entry.at > AccountRouter.STICKY_TTL_MS) {
+        this.sticky.delete(userId);
+      }
+    }
+    // If still over max size, evict oldest entries
+    if (this.sticky.size > AccountRouter.STICKY_MAX_SIZE) {
+      const sorted = [...this.sticky.entries()].sort((a, b) => a[1].at - b[1].at);
+      const toRemove = sorted.slice(0, this.sticky.size - AccountRouter.STICKY_MAX_SIZE);
+      for (const [userId] of toRemove) {
+        this.sticky.delete(userId);
+      }
+    }
   }
 
   /** Release an account after request completes. */
@@ -77,8 +101,8 @@ export class AccountRouter {
     );
 
     // Clear sticky bindings so affected users get re-routed
-    for (const [userId, name] of this.sticky) {
-      if (name === state.account.name) {
+    for (const [userId, entry] of this.sticky) {
+      if (entry.name === state.account.name) {
         this.sticky.delete(userId);
       }
     }
@@ -88,8 +112,8 @@ export class AccountRouter {
     const now = Date.now();
     return this.states.map((s) => {
       let stickyUsers = 0;
-      for (const name of this.sticky.values()) {
-        if (name === s.account.name) stickyUsers++;
+      for (const entry of this.sticky.values()) {
+        if (entry.name === s.account.name) stickyUsers++;
       }
       return {
         name: s.account.name,

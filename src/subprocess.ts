@@ -51,6 +51,8 @@ export interface CliStreamEvent {
   };
 }
 
+const VERBOSE = process.env.CLAW_PROXY_VERBOSE === "1" || process.env.DEBUG === "1";
+
 /**
  * Spawns `claude -p` and emits parsed streaming events.
  *
@@ -117,7 +119,9 @@ export class ClaudeProcess extends EventEmitter {
     this.proc.stdout!.on("data", (chunk: Buffer) => {
       this.resetTimeout(options.timeoutMs);
       const text = chunk.toString();
-      console.log(`[Claude stdout] ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
+      if (VERBOSE) {
+        console.log(`[Claude stdout] ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
+      }
       this.buffer += text;
       this.parseBuffer();
     });
@@ -193,15 +197,7 @@ export class ClaudeProcess extends EventEmitter {
           this.emit("delta", delta.text);
         }
       } else if (parsed.type === "assistant") {
-        // Extract text from assistant message content as a delta fallback
-        const content = parsed.message?.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === "text" && block.text) {
-              this.emit("delta", block.text);
-            }
-          }
-        }
+        // Don't emit delta here — text was already streamed via stream_event deltas
         this.emit("assistant", parsed as CliAssistantMessage);
       } else if (parsed.type === "rate_limit_event") {
         const info = parsed.rate_limit_info;

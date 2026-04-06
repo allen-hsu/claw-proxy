@@ -35,7 +35,7 @@ function isAuthError(text: string): boolean {
 
 function isRateLimit(text: string): boolean {
   const lower = text.toLowerCase();
-  return lower.includes("rate") || lower.includes("limit") || lower.includes("overloaded");
+  return lower.includes("rate_limit") || lower.includes("rate limit") || lower.includes("overloaded") || lower.includes("too many requests");
 }
 
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
@@ -255,7 +255,10 @@ async function handleStreamWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         cleanup();
-        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+          console.error(`[${requestId}] Retry failed: ${err.message}`);
+          if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+        });
         return;
       }
       if (isRateLimit(resultText)) {
@@ -263,7 +266,10 @@ async function handleStreamWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         cleanup();
-        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+          console.error(`[${requestId}] Retry failed: ${err.message}`);
+          if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+        });
         return;
       }
     }
@@ -301,7 +307,10 @@ async function handleStreamWithRetry(
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       cleanup();
-      handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+      handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        console.error(`[${requestId}] Retry failed: ${err.message}`);
+        if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+      });
       return;
     }
     if (!res.writableEnded) {
@@ -319,7 +328,10 @@ async function handleStreamWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
         cleanup();
-        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+          console.error(`[${requestId}] Retry failed: ${err.message}`);
+          if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+        });
         return;
       }
       if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
@@ -401,6 +413,7 @@ async function handleSyncWithRetry(
     );
   }
 
+  const abort = new AbortController();
   const proc = new ClaudeProcess();
   let done = false;
   let fullText = "";
@@ -412,6 +425,13 @@ async function handleSyncWithRetry(
     handle.release();
     router.release(account);
   }
+
+  // Client disconnect
+  res.on("close", () => {
+    abort.abort();
+    proc.kill();
+    cleanup();
+  });
 
   proc.on("delta", (text: string) => {
     fullText += text;
@@ -440,7 +460,10 @@ async function handleSyncWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         cleanup();
-        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+          console.error(`[${requestId}] Retry failed: ${err.message}`);
+          if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
+        });
         return;
       }
       if (isRateLimit(resultText)) {
@@ -448,7 +471,10 @@ async function handleSyncWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         cleanup();
-        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+          console.error(`[${requestId}] Retry failed: ${err.message}`);
+          if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
+        });
         return;
       }
     }
@@ -456,11 +482,15 @@ async function handleSyncWithRetry(
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
       else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
-      res.status(500).json({ error: { message: "Claude request failed", type: "server_error" } });
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: "Claude request failed", type: "server_error" } });
+      }
     } else {
       const { toolCalls } = parseToolCalls(result.result ?? "");
       sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
-      res.json(completionResponse(requestId, model, result));
+      if (!res.headersSent) {
+        res.json(completionResponse(requestId, model, result));
+      }
     }
     cleanup();
   });
@@ -471,7 +501,10 @@ async function handleSyncWithRetry(
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       cleanup();
-      handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+      handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        console.error(`[${requestId}] Retry failed: ${err.message}`);
+        if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
+      });
       return;
     }
     if (!res.headersSent) {
@@ -487,7 +520,10 @@ async function handleSyncWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
         cleanup();
-        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+          console.error(`[${requestId}] Retry failed: ${err.message}`);
+          if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
+        });
         return;
       }
       if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
@@ -503,6 +539,7 @@ async function handleSyncWithRetry(
     configDir: account.account.configDir,
     model,
     timeoutMs: config.timeoutMs,
+    signal: abort.signal,
     sessionId: spawnSessionId,
     resumeId: spawnResumeId,
   });

@@ -26,6 +26,14 @@ if (!config.accounts.length) {
   process.exit(1);
 }
 
+// Validate each account has credentials
+for (const acct of config.accounts) {
+  if (!acct.oauthToken && !acct.configDir) {
+    console.error(`Error: Account "${acct.name}" has neither oauthToken nor configDir`);
+    process.exit(1);
+  }
+}
+
 // Start server
 const app = createServer(config);
 
@@ -50,5 +58,9 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     console.log(`\n[${sig}] Shutting down...`);
     server.close(() => process.exit(0));
+    setTimeout(() => {
+      console.error("Forced shutdown after timeout");
+      process.exit(1);
+    }, 5000);
   });
 }

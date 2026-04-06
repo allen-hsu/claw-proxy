@@ -64,25 +64,34 @@ export class SessionManager {
       await new Promise<void>((resolve) => {
         session!.queue.push({ resolve });
       });
-      // Re-fetch session — it may have been invalidated while we waited
-      session = this.sessionsByUser.get(userId);
-      if (!session) {
-        // Was invalidated — create fresh
-        session = {
-          sessionId: uuid(),
-          accountName: "",
-          toolCallIds: new Set(),
-          lastMessageCount: 0,
-          createdAt: Date.now(),
-          lastUsedAt: Date.now(),
-          busy: true,
-          queue: [],
-        };
-        this.sessionsByUser.set(userId, session);
-        isResume = false;
-      } else {
-        session.busy = true;
-        isResume = session.lastMessageCount > 0;
+      // Re-fetch and check — if busy, re-queue (loop)
+      while (true) {
+        session = this.sessionsByUser.get(userId);
+        if (!session) {
+          // Was invalidated — create fresh
+          session = {
+            sessionId: uuid(),
+            accountName: "",
+            toolCallIds: new Set(),
+            lastMessageCount: 0,
+            createdAt: Date.now(),
+            lastUsedAt: Date.now(),
+            busy: true,
+            queue: [],
+          };
+          this.sessionsByUser.set(userId, session);
+          isResume = false;
+          break;
+        } else if (!session.busy) {
+          session.busy = true;
+          isResume = session.lastMessageCount > 0;
+          break;
+        } else {
+          // Still busy — re-queue
+          await new Promise<void>((resolve) => {
+            session!.queue.push({ resolve });
+          });
+        }
       }
     }
 
@@ -94,12 +103,11 @@ export class SessionManager {
     const release = () => {
       if (released) return;
       released = true;
+      capturedSession.busy = false;
       const next = capturedSession.queue.shift();
       if (next) {
-        // Hand off to next waiter (keep busy=true)
+        // Wake next waiter — it will set busy=true in the acquire loop
         next.resolve();
-      } else {
-        capturedSession.busy = false;
       }
     };
 
@@ -158,16 +166,19 @@ export class SessionManager {
   /** Clean up old sessions (only idle ones). */
   cleanup(maxAgeMs: number): { deleted: number; remaining: number } {
     const now = Date.now();
-    let deleted = 0;
+    const toDelete: string[] = [];
 
     for (const [userId, session] of this.sessionsByUser) {
       if (!session.busy && now - session.lastUsedAt > maxAgeMs) {
-        this.invalidateSession(userId);
-        deleted++;
+        toDelete.push(userId);
       }
     }
 
-    return { deleted, remaining: this.sessionsByUser.size };
+    for (const userId of toDelete) {
+      this.invalidateSession(userId);
+    }
+
+    return { deleted: toDelete.length, remaining: this.sessionsByUser.size };
   }
 
   /** Get status for health endpoint. */

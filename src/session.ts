@@ -1,7 +1,4 @@
 import { v4 as uuid } from "uuid";
-import fs from "fs";
-import path from "path";
-import os from "os";
 
 export interface SessionEntry {
   sessionId: string;
@@ -16,26 +13,104 @@ export interface SessionEntry {
   queue: Array<{ resolve: () => void }>;
 }
 
+export interface SessionHandle {
+  session: SessionEntry;
+  isResume: boolean;
+  /** Call exactly once when the claude process finishes (success, error, or disconnect). */
+  release: () => void;
+}
+
 /**
- * Manages Claude CLI sessions for prompt caching.
- * Sessions are bound to accounts — if the account changes, the session is invalidated.
+ * Manages Claude CLI sessions with built-in locking.
+ *
+ * acquireSession() is the single entry point:
+ * - Creates a session if none exists for the user
+ * - Waits in queue if the session is busy
+ * - Returns a handle with a one-shot release()
  */
 export class SessionManager {
   private sessionsByUser = new Map<string, SessionEntry>();
   private toolCallIdToUser = new Map<string, string>();
 
-  /** Get an existing session for this user, or null if none/invalid. */
-  getSession(userId: string, accountName: string): SessionEntry | null {
-    const session = this.sessionsByUser.get(userId);
-    if (!session) return null;
+  /**
+   * Acquire exclusive access to a session for this user.
+   * Creates a new session if none exists. Waits if the session is busy.
+   * Returns a handle with session info and a one-shot release().
+   */
+  async acquireSession(userId: string, accountName: string): Promise<SessionHandle> {
+    let session = this.sessionsByUser.get(userId);
 
-    // Session must be on the same account
-    if (session.accountName !== accountName) {
+    // If session exists but bound to a different account, invalidate it
+    if (session && session.accountName !== accountName) {
       this.invalidateSession(userId);
-      return null;
+      session = undefined;
     }
 
-    return session;
+    let isResume = false;
+
+    if (!session) {
+      // Create new session — automatically locked (busy=true)
+      session = {
+        sessionId: uuid(),
+        accountName,
+        toolCallIds: new Set(),
+        lastMessageCount: 0,
+        createdAt: Date.now(),
+        lastUsedAt: Date.now(),
+        busy: true,
+        queue: [],
+      };
+      this.sessionsByUser.set(userId, session);
+      isResume = false;
+    } else if (!session.busy) {
+      // Session exists and is free — lock it
+      session.busy = true;
+      isResume = session.lastMessageCount > 0;
+    } else {
+      // Session is busy — wait in queue
+      await new Promise<void>((resolve) => {
+        session!.queue.push({ resolve });
+      });
+      // Re-fetch session — it may have been invalidated while we waited
+      session = this.sessionsByUser.get(userId);
+      if (!session) {
+        // Was invalidated — create fresh
+        session = {
+          sessionId: uuid(),
+          accountName,
+          toolCallIds: new Set(),
+          lastMessageCount: 0,
+          createdAt: Date.now(),
+          lastUsedAt: Date.now(),
+          busy: true,
+          queue: [],
+        };
+        this.sessionsByUser.set(userId, session);
+        isResume = false;
+      } else {
+        session.busy = true;
+        isResume = session.lastMessageCount > 0;
+      }
+    }
+
+    session.lastUsedAt = Date.now();
+
+    // One-shot release to prevent double-unlock
+    let released = false;
+    const capturedSession = session;
+    const release = () => {
+      if (released) return;
+      released = true;
+      const next = capturedSession.queue.shift();
+      if (next) {
+        // Hand off to next waiter (keep busy=true)
+        next.resolve();
+      } else {
+        capturedSession.busy = false;
+      }
+    };
+
+    return { session, isResume, release };
   }
 
   /** Look up a session by tool_call_id (for tool loop continuations). */
@@ -43,63 +118,6 @@ export class SessionManager {
     const userId = this.toolCallIdToUser.get(toolCallId);
     if (!userId) return null;
     return this.sessionsByUser.get(userId) ?? null;
-  }
-
-  /** Create a new session bound to an account. */
-  createSession(userId: string, accountName: string): SessionEntry {
-    // Clean up old session if any
-    this.invalidateSession(userId);
-
-    const session: SessionEntry = {
-      sessionId: uuid(),
-      accountName,
-      toolCallIds: new Set(),
-      lastMessageCount: 0,
-      createdAt: Date.now(),
-      lastUsedAt: Date.now(),
-      busy: false,
-      queue: [],
-    };
-
-    this.sessionsByUser.set(userId, session);
-    return session;
-  }
-
-  /**
-   * Lock a session before spawning a claude process.
-   * If the session is busy, waits in queue until it's free.
-   */
-  async lock(userId: string): Promise<void> {
-    const session = this.sessionsByUser.get(userId);
-    if (!session) return;
-
-    if (!session.busy) {
-      session.busy = true;
-      return;
-    }
-
-    // Session is busy — wait in queue
-    await new Promise<void>((resolve) => {
-      session.queue.push({ resolve });
-    });
-    session.busy = true;
-  }
-
-  /**
-   * Unlock a session after the claude process finishes.
-   * Wakes up the next queued request if any.
-   */
-  unlock(userId: string): void {
-    const session = this.sessionsByUser.get(userId);
-    if (!session) return;
-
-    const next = session.queue.shift();
-    if (next) {
-      // Hand off to next waiter (keep busy=true)
-      next.resolve();
-    } else {
-      session.busy = false;
-    }
   }
 
   /** Update session after a successful response. */
@@ -136,21 +154,21 @@ export class SessionManager {
       this.toolCallIdToUser.delete(id);
     }
 
-    // Wake all queued waiters — they'll find no session and create a new one
-    for (const waiter of session.queue) {
+    // Wake all queued waiters — they'll find no session in acquireSession and create new
+    const waiters = session.queue.splice(0);
+    this.sessionsByUser.delete(userId);
+    for (const waiter of waiters) {
       waiter.resolve();
     }
-
-    this.sessionsByUser.delete(userId);
   }
 
-  /** Clean up old sessions. */
+  /** Clean up old sessions (only idle ones). */
   cleanup(maxAgeMs: number): { deleted: number; remaining: number } {
     const now = Date.now();
     let deleted = 0;
 
     for (const [userId, session] of this.sessionsByUser) {
-      if (now - session.lastUsedAt > maxAgeMs) {
+      if (!session.busy && now - session.lastUsedAt > maxAgeMs) {
         this.invalidateSession(userId);
         deleted++;
       }

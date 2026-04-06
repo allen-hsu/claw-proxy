@@ -149,43 +149,46 @@ async function handleStreamWithRetry(
   attempt: number,
   userId: string
 ): Promise<void> {
-  const account = router.acquire(userId);
-  if (!account) {
-    res.status(503).json({
-      error: { message: "No accounts available", type: "server_error" },
-    });
+  // 1. Acquire session lock first (may wait if session is busy)
+  const handle = await sessions.acquireSession(userId, "pending");
+
+  // 2. Now acquire account (after lock, so activeRequests is accurate)
+  const maybeAccount = router.acquire(userId);
+  if (!maybeAccount) {
+    handle.release();
+    if (!res.headersSent) {
+      res.status(503).json({
+        error: { message: "No accounts available", type: "server_error" },
+      });
+    }
     return;
   }
+  const account = maybeAccount;
 
-  // Session management: decide resume vs new
-  const existingSession = sessions.getSession(userId, account.account.name);
+  // Update session's account binding if it changed
+  handle.session.accountName = account.account.name;
 
-  // Lock session — waits if another request is using it
-  await sessions.lock(userId);
+  // Decide resume vs new
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
-  if (existingSession && existingSession.lastMessageCount > 0 && existingSession.lastMessageCount < messages.length) {
-    // Resume existing session — only send new messages
-    spawnResumeId = existingSession.sessionId;
-    prompt = extractNewMessages(messages, existingSession.lastMessageCount);
+  if (handle.isResume && handle.session.lastMessageCount < messages.length) {
+    spawnResumeId = handle.session.sessionId;
+    prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
-      // Fallback to full history if delta is empty
       spawnResumeId = undefined;
-      spawnSessionId = existingSession.sessionId;
+      spawnSessionId = handle.session.sessionId;
       prompt = messagesToPrompt(messages, tools);
     }
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${existingSession.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
     );
   } else {
-    // New session or first request
-    const newSession = existingSession ?? sessions.createSession(userId, account.account.name);
-    spawnSessionId = newSession.sessionId;
+    spawnSessionId = handle.session.sessionId;
     prompt = messagesToPrompt(messages, tools);
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${newSession.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
     );
   }
 
@@ -199,16 +202,22 @@ async function handleStreamWithRetry(
 
   const abort = new AbortController();
   const proc = new ClaudeProcess();
-  let gotResult = false;
+  let done = false;
   let fullText = "";
-  let rateLimitResetsAt = 0; // epoch seconds from rate_limit_event
+  let rateLimitResetsAt = 0;
+
+  function cleanup() {
+    if (done) return;
+    done = true;
+    handle.release();
+    router.release(account);
+  }
 
   // Client disconnect
   res.on("close", () => {
     abort.abort();
     proc.kill();
-    sessions.unlock(userId);
-    router.release(account);
+    cleanup();
   });
 
   proc.on("delta", (text: string) => {
@@ -221,65 +230,52 @@ async function handleStreamWithRetry(
       const cooldownMs = rateLimitResetsAt
         ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
         : RATE_COOLDOWN_MS;
-      console.log(`[${requestId}] Rate limit rejected on ${account.account.name}, cooldown ${Math.round(cooldownMs / 1000)}s (resets ${new Date(rateLimitResetsAt * 1000).toLocaleTimeString()})`);
+      console.log(`[${requestId}] Rate limit rejected on ${account.account.name}, cooldown ${Math.round(cooldownMs / 1000)}s`);
       router.cooldown(account, cooldownMs);
     }
   });
 
   proc.on("result", (result: CliResultMessage) => {
-    gotResult = true;
     const resultText = result.result || "";
-
-    // Compute rate limit cooldown from resetsAt if available
     const rateCooldownMs = rateLimitResetsAt
       ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
       : RATE_COOLDOWN_MS;
 
-    // Check for retryable errors
+    // Retryable errors
     if (result.is_error && attempt < MAX_RETRIES - 1) {
       if (isAuthError(resultText)) {
         console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
-        sessions.unlock(userId);
-    router.release(account);
+        cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
       if (isRateLimit(resultText)) {
-        console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
-        sessions.unlock(userId);
-    router.release(account);
+        cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
     }
 
-    // Non-retryable error or last attempt — cooldown and respond
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
       else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
     }
 
-    // Build response
     const responseText = fullText || resultText;
     const { cleanText, toolCalls } = parseToolCalls(responseText);
 
-    // Update session with tool_call_ids and message count
     if (!result.is_error) {
-      const tcIds = toolCalls.map((tc) => tc.id);
-      sessions.updateSession(userId, tcIds, messages.length);
+      sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
     }
 
     if (toolCalls.length > 0) {
-      console.log(
-        `[${requestId}] → tool_calls: [${toolCalls.map((tc) => tc.function.name).join(", ")}]`
-      );
-      if (cleanText) {
-        res.write(streamChunk(requestId, model, cleanText, null, true));
-      }
+      console.log(`[${requestId}] → tool_calls: [${toolCalls.map((tc) => tc.function.name).join(", ")}]`);
+      if (cleanText) res.write(streamChunk(requestId, model, cleanText, null, true));
       res.write(streamChunk(requestId, model, null, null, !cleanText, toolCalls));
       res.write(streamChunk(requestId, model, null, "tool_calls"));
     } else {
@@ -289,54 +285,42 @@ async function handleStreamWithRetry(
 
     res.write("data: [DONE]\n\n");
     res.end();
-    sessions.unlock(userId);
-    router.release(account);
+    cleanup();
   });
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
-
-    // Retry on process errors (e.g. CLI crash)
     if (attempt < MAX_RETRIES - 1) {
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
-      sessions.unlock(userId);
-    router.release(account);
+      cleanup();
       handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
       return;
     }
-
     if (!res.writableEnded) {
-      res.write(
-        `data: ${JSON.stringify({ error: { message: "Internal error", type: "server_error" } })}\n\n`
-      );
+      res.write(`data: ${JSON.stringify({ error: { message: "Internal error", type: "server_error" } })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
     }
-    sessions.unlock(userId);
-    router.release(account);
+    cleanup();
   });
 
   proc.on("close", (code: number) => {
-    if (!gotResult) {
-      // Non-zero exit without a result — retry
+    if (!done) {
       if (code !== 0 && attempt < MAX_RETRIES - 1) {
         console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
-        sessions.unlock(userId);
-    router.release(account);
+        cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
-
       if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      sessions.unlock(userId);
-    router.release(account);
+      cleanup();
     }
   });
 
@@ -365,47 +349,56 @@ async function handleSyncWithRetry(
   attempt: number,
   userId: string
 ): Promise<void> {
-  const account = router.acquire(userId);
-  if (!account) {
-    res.status(503).json({
-      error: { message: "No accounts available", type: "server_error" },
-    });
+  const handle = await sessions.acquireSession(userId, "pending");
+
+  const maybeAccount = router.acquire(userId);
+  if (!maybeAccount) {
+    handle.release();
+    if (!res.headersSent) {
+      res.status(503).json({
+        error: { message: "No accounts available", type: "server_error" },
+      });
+    }
     return;
   }
+  const account = maybeAccount;
 
-  // Session management
-  const existingSession = sessions.getSession(userId, account.account.name);
+  handle.session.accountName = account.account.name;
 
-  // Lock session — waits if another request is using it
-  await sessions.lock(userId);
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
-  if (existingSession && existingSession.lastMessageCount > 0 && existingSession.lastMessageCount < messages.length) {
-    spawnResumeId = existingSession.sessionId;
-    prompt = extractNewMessages(messages, existingSession.lastMessageCount);
+  if (handle.isResume && handle.session.lastMessageCount < messages.length) {
+    spawnResumeId = handle.session.sessionId;
+    prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
       spawnResumeId = undefined;
-      spawnSessionId = existingSession.sessionId;
+      spawnSessionId = handle.session.sessionId;
       prompt = messagesToPrompt(messages, tools);
     }
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${existingSession.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
     );
   } else {
-    const newSession = existingSession ?? sessions.createSession(userId, account.account.name);
-    spawnSessionId = newSession.sessionId;
+    spawnSessionId = handle.session.sessionId;
     prompt = messagesToPrompt(messages, tools);
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${newSession.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
     );
   }
 
   const proc = new ClaudeProcess();
+  let done = false;
   let fullText = "";
-  let gotResult = false;
   let rateLimitResetsAt = 0;
+
+  function cleanup() {
+    if (done) return;
+    done = true;
+    handle.release();
+    router.release(account);
+  }
 
   proc.on("delta", (text: string) => {
     fullText += text;
@@ -423,93 +416,72 @@ async function handleSyncWithRetry(
   });
 
   proc.on("result", (result: CliResultMessage) => {
-    gotResult = true;
     const resultText = result.result || "";
-
     const rateCooldownMs = rateLimitResetsAt
       ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
       : RATE_COOLDOWN_MS;
 
-    // Check for retryable errors
     if (result.is_error && attempt < MAX_RETRIES - 1) {
       if (isAuthError(resultText)) {
         console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
-        sessions.unlock(userId);
-    router.release(account);
+        cleanup();
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
       if (isRateLimit(resultText)) {
-        console.error(`[${requestId}] Rate limit on ${account.account.name}, cooldown ${Math.round(rateCooldownMs / 1000)}s, retrying...`);
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
-        sessions.unlock(userId);
-    router.release(account);
+        cleanup();
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
     }
 
-    // Non-retryable or last attempt
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
       else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
-      res.status(500).json({
-        error: { message: "Claude request failed", type: "server_error" },
-      });
+      res.status(500).json({ error: { message: "Claude request failed", type: "server_error" } });
     } else {
-      // Update session
       const { toolCalls } = parseToolCalls(result.result ?? "");
       sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
       res.json(completionResponse(requestId, model, result));
     }
-    sessions.unlock(userId);
-    router.release(account);
+    cleanup();
   });
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
-
     if (attempt < MAX_RETRIES - 1) {
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
-      sessions.unlock(userId);
-    router.release(account);
+      cleanup();
       handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
       return;
     }
-
     if (!res.headersSent) {
-      res.status(500).json({
-        error: { message: "Internal error", type: "server_error" },
-      });
+      res.status(500).json({ error: { message: "Internal error", type: "server_error" } });
     }
-    sessions.unlock(userId);
-    router.release(account);
+    cleanup();
   });
 
   proc.on("close", (code: number) => {
-    if (!gotResult) {
+    if (!done) {
       if (code !== 0 && attempt < MAX_RETRIES - 1) {
         console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, EXIT_COOLDOWN_MS);
-        sessions.unlock(userId);
-    router.release(account);
+        cleanup();
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId);
         return;
       }
-
       if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
       if (!res.headersSent) {
-        res.status(500).json({
-          error: { message: `Process exited with code ${code}`, type: "server_error" },
-        });
+        res.status(500).json({ error: { message: `Process exited with code ${code}`, type: "server_error" } });
       }
-      sessions.unlock(userId);
-    router.release(account);
+      cleanup();
     }
   });
 

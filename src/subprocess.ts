@@ -73,6 +73,12 @@ export class ClaudeProcess extends EventEmitter {
       options.model,
       "--max-turns",
       "1",
+      "--tools",
+      "",
+      "--dangerously-skip-permissions",
+      "--mcp-config",
+      '{"mcpServers":{}}',
+      "--strict-mcp-config",
     ];
 
     const env: Record<string, string | undefined> = { ...process.env };

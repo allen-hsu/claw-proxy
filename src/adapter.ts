@@ -4,13 +4,30 @@ import type { CliResultMessage } from "./subprocess.js";
 // --- Request: OpenAI -> Claude CLI prompt ---
 
 export interface OpenAIMessage {
-  role: "system" | "developer" | "user" | "assistant";
+  role: "system" | "developer" | "user" | "assistant" | "tool";
   content: string | Array<{ type: string; text?: string }> | null;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
+  name?: string;
+}
+
+export interface OpenAIToolDef {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters?: object;
+  };
 }
 
 export interface OpenAIRequest {
   model: string;
   messages: OpenAIMessage[];
+  tools?: OpenAIToolDef[];
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
@@ -43,28 +60,153 @@ function extractText(content: OpenAIMessage["content"]): string {
     .join("\n");
 }
 
-export function messagesToPrompt(messages: OpenAIMessage[]): string {
-  const parts: string[] = [];
+// --- Gateway-internal tools that should not be listed ---
+const GATEWAY_BLOCKED = new Set(["sessions_send", "sessions_spawn", "gateway"]);
+
+export function buildToolInstructions(tools: OpenAIToolDef[]): string {
+  if (!tools || tools.length === 0) return "";
+
+  const lines = [
+    "",
+    "---",
+    "",
+    "## Tool Calling Protocol",
+    "",
+    "When you need to use a tool, output EXACTLY this format and then STOP:",
+    "",
+    "<tool_call>",
+    '{"name": "tool_name", "arguments": {"key": "value"}}',
+    "</tool_call>",
+    "",
+    "You may request multiple tools at once:",
+    "",
+    "<tool_call>",
+    '{"name": "web_search", "arguments": {"query": "bitcoin price"}}',
+    "</tool_call>",
+    "<tool_call>",
+    '{"name": "memory_search", "arguments": {"query": "user preferences"}}',
+    "</tool_call>",
+    "",
+    "CRITICAL RULES:",
+    "- Do NOT execute tools yourself. Do NOT use Bash, Read, Write, Edit, WebSearch, WebFetch, Glob, Grep, or any native tools.",
+    "- Output <tool_call> blocks and STOP. The orchestrator will execute them and provide results.",
+    "- If you do not need any tools, just respond with your answer directly.",
+    "- The conversation may already contain tool results from previous turns — use them, do not re-request.",
+    "",
+    "Available tools:",
+  ];
+
+  for (const tool of tools) {
+    const name = tool.function?.name;
+    if (!name || GATEWAY_BLOCKED.has(name)) continue;
+    const desc = tool.function?.description || "";
+    lines.push(`- **${name}**: ${desc}`);
+  }
+
+  return lines.join("\n");
+}
+
+export function messagesToPrompt(
+  messages: OpenAIMessage[],
+  tools?: OpenAIToolDef[]
+): string {
+  const systemParts: string[] = [];
+  const conversationParts: string[] = [];
 
   for (const msg of messages) {
     const text = extractText(msg.content);
-    if (!text) continue;
 
     switch (msg.role) {
       case "system":
       case "developer":
-        parts.push(`<system>\n${text}\n</system>`);
+        if (text) systemParts.push(text);
         break;
       case "user":
-        parts.push(text);
+        if (text) conversationParts.push(`User: ${text}`);
         break;
-      case "assistant":
-        parts.push(`<previous_response>\n${text}\n</previous_response>`);
+      case "assistant": {
+        const parts: string[] = [];
+        if (text) parts.push(text);
+        // Include tool_calls so Claude sees what was previously requested
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            const fn = tc.function;
+            parts.push(
+              `<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || "{}"}}\n</tool_call>`
+            );
+          }
+        }
+        if (parts.length > 0) {
+          conversationParts.push(
+            `<previous_response>\n${parts.join("\n")}\n</previous_response>`
+          );
+        }
         break;
+      }
+      case "tool": {
+        const toolName = msg.name || "";
+        const toolId = msg.tool_call_id || "";
+        if (text) {
+          conversationParts.push(
+            `<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`
+          );
+        }
+        break;
+      }
     }
   }
 
-  return parts.join("\n\n");
+  // Build system prompt with tool instructions
+  const toolInstructions = buildToolInstructions(tools ?? []);
+  const systemPrompt = systemParts.join("\n\n") + toolInstructions;
+
+  const allParts: string[] = [];
+  if (systemPrompt) {
+    allParts.push(`<system>\n${systemPrompt}\n</system>`);
+  }
+  allParts.push(...conversationParts);
+
+  return allParts.join("\n\n");
+}
+
+// --- Parse <tool_call> blocks from Claude's response ---
+
+export interface ParsedToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+export function parseToolCalls(text: string): {
+  cleanText: string;
+  toolCalls: ParsedToolCall[];
+} {
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  const toolCalls: ParsedToolCall[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      toolCalls.push({
+        id: `call_${uuid().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: parsed.name,
+          arguments:
+            typeof parsed.arguments === "string"
+              ? parsed.arguments
+              : JSON.stringify(parsed.arguments ?? {}),
+        },
+      });
+    } catch {
+      // skip malformed tool calls
+    }
+  }
+
+  const cleanText = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+
+  return { cleanText, toolCalls };
 }
 
 // --- Response: Claude CLI -> OpenAI format ---
@@ -77,9 +219,22 @@ export function streamChunk(
   requestId: string,
   model: string,
   content: string | null,
-  finishReason: "stop" | null = null,
-  isFirst = false
+  finishReason: "stop" | "tool_calls" | null = null,
+  isFirst = false,
+  toolCalls?: ParsedToolCall[]
 ): string {
+  const delta: Record<string, unknown> = {};
+  if (isFirst) delta.role = "assistant";
+  if (content !== null) delta.content = content;
+  if (toolCalls?.length) {
+    delta.tool_calls = toolCalls.map((tc, i) => ({
+      index: i,
+      id: tc.id,
+      type: "function",
+      function: { name: tc.function.name, arguments: tc.function.arguments },
+    }));
+  }
+
   const chunk = {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion.chunk",
@@ -88,10 +243,7 @@ export function streamChunk(
     choices: [
       {
         index: 0,
-        delta: {
-          ...(isFirst ? { role: "assistant" as const } : {}),
-          ...(content !== null ? { content } : {}),
-        },
+        delta,
         finish_reason: finishReason,
       },
     ],
@@ -104,6 +256,17 @@ export function completionResponse(
   model: string,
   result: CliResultMessage
 ): object {
+  const { cleanText, toolCalls } = parseToolCalls(result.result ?? "");
+  const finishReason = toolCalls.length > 0 ? "tool_calls" : "stop";
+
+  const message: Record<string, unknown> = {
+    role: "assistant",
+    content: cleanText || (toolCalls.length > 0 ? null : ""),
+  };
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+  }
+
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion",
@@ -112,8 +275,8 @@ export function completionResponse(
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: result.result ?? "" },
-        finish_reason: "stop",
+        message,
+        finish_reason: finishReason,
       },
     ],
     usage: {

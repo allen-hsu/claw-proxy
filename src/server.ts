@@ -9,6 +9,7 @@ import {
   makeRequestId,
   streamChunk,
   completionResponse,
+  parseToolCalls,
 } from "./adapter.js";
 
 export function createServer(config: Config) {
@@ -63,7 +64,7 @@ export function createServer(config: Config) {
 
     const requestId = makeRequestId();
     const model = resolveModel(body.model, config.defaultModel);
-    const prompt = messagesToPrompt(body.messages);
+    const prompt = messagesToPrompt(body.messages, body.tools);
     const account = router.acquire();
 
     if (!account) {
@@ -108,8 +109,8 @@ function handleStream(
 
   const abort = new AbortController();
   const proc = new ClaudeProcess();
-  let sentFirst = false;
   let gotResult = false;
+  let fullText = "";
 
   // Client disconnect
   res.on("close", () => {
@@ -118,23 +119,43 @@ function handleStream(
     router.release(account);
   });
 
+  // Collect full text — we need to parse tool_calls at the end
   proc.on("delta", (text: string) => {
-    if (!sentFirst) {
-      res.write(streamChunk(requestId, model, "", null, true));
-      sentFirst = true;
-    }
-    res.write(streamChunk(requestId, model, text));
+    fullText += text;
   });
 
   proc.on("result", (result: CliResultMessage) => {
     gotResult = true;
     if (result.is_error) {
-      // Check if rate limited
       if (result.result?.includes("rate") || result.result?.includes("limit")) {
         router.cooldown(account);
       }
     }
-    res.write(streamChunk(requestId, model, null, "stop"));
+
+    // Use result text if we didn't collect deltas
+    const responseText = fullText || result.result || "";
+    const { cleanText, toolCalls } = parseToolCalls(responseText);
+
+    if (toolCalls.length > 0) {
+      console.log(
+        `[${requestId}] → tool_calls: [${toolCalls.map((tc) => tc.function.name).join(", ")}]`
+      );
+      // Send text before tool calls if any
+      if (cleanText) {
+        res.write(streamChunk(requestId, model, cleanText, null, true));
+      }
+      // Send tool_calls
+      res.write(
+        streamChunk(requestId, model, null, null, !cleanText, toolCalls)
+      );
+      // Send finish with tool_calls reason
+      res.write(streamChunk(requestId, model, null, "tool_calls"));
+    } else {
+      // Normal text response — send as single chunk
+      res.write(streamChunk(requestId, model, cleanText, null, true));
+      res.write(streamChunk(requestId, model, null, "stop"));
+    }
+
     res.write("data: [DONE]\n\n");
     res.end();
     router.release(account);
@@ -142,7 +163,7 @@ function handleStream(
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
-    if (!sentFirst) {
+    if (!res.writableEnded) {
       res.write(
         `data: ${JSON.stringify({ error: { message: "Internal error", type: "server_error" } })}\n\n`
       );

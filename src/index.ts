@@ -55,17 +55,6 @@ const server = app.listen(config.port, config.host, () => {
   `);
 });
 
-// Log and exit on unexpected errors — let Docker/systemd restart
-process.on("uncaughtException", (err) => {
-  console.error("[FATAL] Uncaught exception:", err.message);
-  console.error(err.stack);
-  process.exit(1);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[FATAL] Unhandled rejection:", reason);
-  process.exit(1);
-});
-
 // Graceful shutdown
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {

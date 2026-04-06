@@ -60,16 +60,8 @@ export class AccountRouter {
       }
     }
 
-    // All in cooldown — pick soonest
-    let soonest = this.states[0];
-    for (const s of this.states) {
-      if (s.cooldownUntil < soonest.cooldownUntil) soonest = s;
-    }
-    soonest.activeRequests++;
-    if (userId) {
-      this.sticky.set(userId, soonest.account.name);
-    }
-    return soonest;
+    // All in cooldown — return null, let caller handle (503 or retry later)
+    return null;
   }
 
   /** Release an account after request completes. */

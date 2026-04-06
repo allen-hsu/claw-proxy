@@ -19,6 +19,13 @@ if (!cli.ok) {
   process.exit(1);
 }
 
+// Fail fast if no accounts configured
+if (!config.accounts.length) {
+  console.error("Error: No accounts configured in", getConfigPath());
+  console.error("Run with --setup for instructions.");
+  process.exit(1);
+}
+
 // Start server
 const app = createServer(config);
 

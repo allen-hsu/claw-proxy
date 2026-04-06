@@ -68,8 +68,15 @@ export function createServer(config: Config) {
     next();
   });
 
-  // Health
-  app.get("/health", (_req, res) => {
+  // Health — requires auth to prevent info leak (account names, user IDs)
+  app.get("/health", (req, res) => {
+    if (config.bearerToken) {
+      const auth = req.headers.authorization;
+      if (auth !== `Bearer ${config.bearerToken}`) {
+        res.json({ status: "ok", timestamp: new Date().toISOString() });
+        return;
+      }
+    }
     res.json({
       status: "ok",
       accounts: router.status(),
@@ -84,8 +91,12 @@ export function createServer(config: Config) {
       object: "list",
       data: [
         { id: "claude-opus-4", object: "model", owned_by: "anthropic" },
+        { id: "claude-opus-4-6", object: "model", owned_by: "anthropic" },
         { id: "claude-sonnet-4", object: "model", owned_by: "anthropic" },
+        { id: "claude-sonnet-4-5", object: "model", owned_by: "anthropic" },
+        { id: "claude-sonnet-4-6", object: "model", owned_by: "anthropic" },
         { id: "claude-haiku-4", object: "model", owned_by: "anthropic" },
+        { id: "claude-haiku-4-5", object: "model", owned_by: "anthropic" },
       ],
     });
   });

@@ -71,7 +71,7 @@ Add a custom provider to your `openclaw.json`:
             "id": "claude-opus-4-6",
             "name": "Claude Opus 4.6",
             "reasoning": true,
-            "input": ["text", "image"],
+            "input": ["text"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
             "contextWindow": 1000000,
             "maxTokens": 32000
@@ -80,7 +80,7 @@ Add a custom provider to your `openclaw.json`:
             "id": "claude-sonnet-4-6",
             "name": "Claude Sonnet 4.6",
             "reasoning": true,
-            "input": ["text", "image"],
+            "input": ["text"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
             "contextWindow": 1000000,
             "maxTokens": 32000

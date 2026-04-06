@@ -31,6 +31,7 @@ export interface OpenAIRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  user?: string;
 }
 
 const MODEL_MAP: Record<string, string> = {

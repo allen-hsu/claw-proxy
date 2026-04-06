@@ -12,6 +12,28 @@ import {
   parseToolCalls,
 } from "./adapter.js";
 
+const MAX_RETRIES = 3;
+const AUTH_COOLDOWN_MS = 300_000; // 5 minutes
+const RATE_COOLDOWN_MS = 60_000;  // 1 minute
+const EXIT_COOLDOWN_MS = 30_000;  // 30 seconds
+
+function isAuthError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("authentication_error") ||
+    lower.includes("unauthorized") ||
+    lower.includes("invalid token") ||
+    lower.includes("token expired") ||
+    lower.includes("not authenticated") ||
+    lower.includes("auth") && lower.includes("error")
+  );
+}
+
+function isRateLimit(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes("rate") || lower.includes("limit") || lower.includes("overloaded");
+}
+
 export function createServer(config: Config) {
   const app = express();
   const router = new AccountRouter(config.accounts);
@@ -65,23 +87,18 @@ export function createServer(config: Config) {
     const requestId = makeRequestId();
     const model = resolveModel(body.model, config.defaultModel);
     const prompt = messagesToPrompt(body.messages, body.tools);
-    const account = router.acquire();
 
-    if (!account) {
-      res.status(503).json({
-        error: { message: "No accounts available", type: "server_error" },
-      });
-      return;
-    }
+    // Use "user" field from OpenAI request for sticky routing
+    const userId = body.user || req.ip || "default";
 
     console.log(
-      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | account=${account.account.name} | messages=${body.messages.length} | prompt_len=${prompt.length}`
+      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | messages=${body.messages.length} | prompt_len=${prompt.length}`
     );
 
     if (body.stream) {
-      handleStream(res, requestId, model, prompt, account, config, router);
+      handleStreamWithRetry(res, requestId, model, prompt, config, router, 0, userId);
     } else {
-      handleSync(res, requestId, model, prompt, account, config, router);
+      handleSyncWithRetry(res, requestId, model, prompt, config, router, 0, userId);
     }
   });
 
@@ -93,19 +110,37 @@ export function createServer(config: Config) {
   return app;
 }
 
-function handleStream(
+// --- Streaming with retry ---
+
+function handleStreamWithRetry(
   res: Response,
   requestId: string,
   model: string,
   prompt: string,
-  account: AccountState,
   config: Config,
-  router: AccountRouter
+  router: AccountRouter,
+  attempt: number,
+  userId?: string
 ): void {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
+  const account = router.acquire(userId);
+  if (!account) {
+    res.status(503).json({
+      error: { message: "No accounts available", type: "server_error" },
+    });
+    return;
+  }
+
+  console.log(
+    `[${requestId}] attempt=${attempt + 1} | account=${account.account.name}`
+  );
+
+  // Only set headers on first attempt
+  if (attempt === 0) {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+  }
 
   const abort = new AbortController();
   const proc = new ClaudeProcess();
@@ -119,39 +154,52 @@ function handleStream(
     router.release(account);
   });
 
-  // Collect full text — we need to parse tool_calls at the end
   proc.on("delta", (text: string) => {
     fullText += text;
   });
 
   proc.on("result", (result: CliResultMessage) => {
     gotResult = true;
-    if (result.is_error) {
-      if (result.result?.includes("rate") || result.result?.includes("limit")) {
-        router.cooldown(account);
+    const resultText = result.result || "";
+
+    // Check for retryable errors
+    if (result.is_error && attempt < MAX_RETRIES - 1) {
+      if (isAuthError(resultText)) {
+        console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
+        router.cooldown(account, AUTH_COOLDOWN_MS);
+        router.release(account);
+        handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        return;
+      }
+      if (isRateLimit(resultText)) {
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
+        router.cooldown(account, RATE_COOLDOWN_MS);
+        router.release(account);
+        handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        return;
       }
     }
 
-    // Use result text if we didn't collect deltas
-    const responseText = fullText || result.result || "";
+    // Non-retryable error or last attempt — cooldown and respond
+    if (result.is_error) {
+      if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
+      else if (isRateLimit(resultText)) router.cooldown(account, RATE_COOLDOWN_MS);
+    }
+
+    // Build response
+    const responseText = fullText || resultText;
     const { cleanText, toolCalls } = parseToolCalls(responseText);
 
     if (toolCalls.length > 0) {
       console.log(
         `[${requestId}] → tool_calls: [${toolCalls.map((tc) => tc.function.name).join(", ")}]`
       );
-      // Send text before tool calls if any
       if (cleanText) {
         res.write(streamChunk(requestId, model, cleanText, null, true));
       }
-      // Send tool_calls
-      res.write(
-        streamChunk(requestId, model, null, null, !cleanText, toolCalls)
-      );
-      // Send finish with tool_calls reason
+      res.write(streamChunk(requestId, model, null, null, !cleanText, toolCalls));
       res.write(streamChunk(requestId, model, null, "tool_calls"));
     } else {
-      // Normal text response — send as single chunk
       res.write(streamChunk(requestId, model, cleanText, null, true));
       res.write(streamChunk(requestId, model, null, "stop"));
     }
@@ -163,22 +211,37 @@ function handleStream(
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
+
+    // Retry on process errors (e.g. CLI crash)
+    if (attempt < MAX_RETRIES - 1) {
+      router.cooldown(account, EXIT_COOLDOWN_MS);
+      router.release(account);
+      handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+      return;
+    }
+
     if (!res.writableEnded) {
       res.write(
         `data: ${JSON.stringify({ error: { message: "Internal error", type: "server_error" } })}\n\n`
       );
+      res.write("data: [DONE]\n\n");
+      res.end();
     }
-    res.write("data: [DONE]\n\n");
-    res.end();
     router.release(account);
   });
 
   proc.on("close", (code: number) => {
     if (!gotResult) {
-      if (code !== 0) {
-        console.error(`[${requestId}] Process exited with code ${code}`);
-        router.cooldown(account, 30_000);
+      // Non-zero exit without a result — retry
+      if (code !== 0 && attempt < MAX_RETRIES - 1) {
+        console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+        router.cooldown(account, EXIT_COOLDOWN_MS);
+        router.release(account);
+        handleStreamWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        return;
       }
+
+      if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
@@ -196,27 +259,64 @@ function handleStream(
   });
 }
 
-function handleSync(
+// --- Sync with retry ---
+
+function handleSyncWithRetry(
   res: Response,
   requestId: string,
   model: string,
   prompt: string,
-  account: AccountState,
   config: Config,
-  router: AccountRouter
+  router: AccountRouter,
+  attempt: number,
+  userId?: string
 ): void {
+  const account = router.acquire(userId);
+  if (!account) {
+    res.status(503).json({
+      error: { message: "No accounts available", type: "server_error" },
+    });
+    return;
+  }
+
+  console.log(
+    `[${requestId}] attempt=${attempt + 1} | account=${account.account.name}`
+  );
+
   const proc = new ClaudeProcess();
   let fullText = "";
+  let gotResult = false;
 
   proc.on("delta", (text: string) => {
     fullText += text;
   });
 
   proc.on("result", (result: CliResultMessage) => {
-    if (result.is_error) {
-      if (result.result?.includes("rate") || result.result?.includes("limit")) {
-        router.cooldown(account);
+    gotResult = true;
+    const resultText = result.result || "";
+
+    // Check for retryable errors
+    if (result.is_error && attempt < MAX_RETRIES - 1) {
+      if (isAuthError(resultText)) {
+        console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
+        router.cooldown(account, AUTH_COOLDOWN_MS);
+        router.release(account);
+        handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        return;
       }
+      if (isRateLimit(resultText)) {
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
+        router.cooldown(account, RATE_COOLDOWN_MS);
+        router.release(account);
+        handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        return;
+      }
+    }
+
+    // Non-retryable or last attempt
+    if (result.is_error) {
+      if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
+      else if (isRateLimit(resultText)) router.cooldown(account, RATE_COOLDOWN_MS);
       res.status(500).json({
         error: { message: "Claude request failed", type: "server_error" },
       });
@@ -228,18 +328,38 @@ function handleSync(
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
-    res.status(500).json({
-      error: { message: "Internal error", type: "server_error" },
-    });
+
+    if (attempt < MAX_RETRIES - 1) {
+      router.cooldown(account, EXIT_COOLDOWN_MS);
+      router.release(account);
+      handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+      return;
+    }
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: { message: "Internal error", type: "server_error" },
+      });
+    }
     router.release(account);
   });
 
   proc.on("close", (code: number) => {
-    if (code !== 0 && !res.headersSent) {
-      router.cooldown(account, 30_000);
-      res.status(500).json({
-        error: { message: `Process exited with code ${code}`, type: "server_error" },
-      });
+    if (!gotResult) {
+      if (code !== 0 && attempt < MAX_RETRIES - 1) {
+        console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+        router.cooldown(account, EXIT_COOLDOWN_MS);
+        router.release(account);
+        handleSyncWithRetry(res, requestId, model, prompt, config, router, attempt + 1, userId);
+        return;
+      }
+
+      if (code !== 0) router.cooldown(account, EXIT_COOLDOWN_MS);
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: { message: `Process exited with code ${code}`, type: "server_error" },
+        });
+      }
       router.release(account);
     }
   });

@@ -2,7 +2,7 @@ import { createHash } from "crypto";
 import express, { type Request, type Response } from "express";
 import type { Config } from "./config.js";
 import { AccountRouter, type AccountState } from "./router.js";
-import { ClaudeProcess, type CliResultMessage } from "./subprocess.js";
+import { ClaudeProcess, type CliAssistantMessage, type CliResultMessage } from "./subprocess.js";
 import { SessionManager } from "./session.js";
 import {
   type OpenAIRequest,
@@ -231,14 +231,28 @@ async function handleStreamWithRetry(
     spawnResumeId = handle.session.sessionId;
     prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
+      // Nothing new to send — can't resume, start fresh session
       spawnResumeId = undefined;
+      sessions.invalidateSession(userId);
+      handle = await sessions.acquireSession(userId);
+      handle.session.accountName = account.account.name;
       spawnSessionId = handle.session.sessionId;
       prompt = messagesToPrompt(messages, tools);
+      console.log(
+        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | REFRESH session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
+      );
+    } else {
+      console.log(
+        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+      );
     }
-    console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
-    );
   } else {
+    // Session was used before but can't resume — create fresh session ID
+    if (handle.session.lastMessageCount > 0) {
+      sessions.invalidateSession(userId);
+      handle = await sessions.acquireSession(userId);
+      handle.session.accountName = account.account.name;
+    }
     spawnSessionId = handle.session.sessionId;
     prompt = messagesToPrompt(messages, tools);
     console.log(
@@ -259,6 +273,7 @@ async function handleStreamWithRetry(
   let done = false;
   let fullText = "";
   let rateLimitResetsAt = 0;
+  let sessionCollision = false;
 
   function cleanup() {
     if (done) return;
@@ -281,6 +296,20 @@ async function handleStreamWithRetry(
 
   proc.on("delta", (text: string) => {
     fullText += text;
+  });
+
+  // Capture filtered text from assistant message (thinking blocks already removed in subprocess)
+  proc.on("assistant", (msg: CliAssistantMessage) => {
+    if (!fullText && Array.isArray(msg.message?.content)) {
+      fullText = msg.message.content
+        .filter((b) => b.type === "text" && b.text)
+        .map((b) => b.text!)
+        .join("\n");
+    }
+  });
+
+  proc.on("session_collision", () => {
+    sessionCollision = true;
   });
 
   proc.on("rate_limit", (info: { status: string; resetsAt?: number }) => {
@@ -376,9 +405,14 @@ async function handleStreamWithRetry(
   proc.on("close", (code: number) => {
     if (!done) {
       if (code !== 0 && attempt < MAX_RETRIES - 1) {
-        console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
-        router.cooldown(account, EXIT_COOLDOWN_MS);
+        if (sessionCollision) {
+          // Session collision is not an account health issue — retry without cooldown
+          console.error(`[${requestId}] Session collision on ${account.account.name}, retrying with fresh session...`);
+        } else {
+          console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+          router.cooldown(account, EXIT_COOLDOWN_MS);
+        }
         cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
@@ -388,7 +422,7 @@ async function handleStreamWithRetry(
       }
       if (code !== 0) {
         sessions.invalidateSession(userId);
-        router.cooldown(account, EXIT_COOLDOWN_MS);
+        if (!sessionCollision) router.cooldown(account, EXIT_COOLDOWN_MS);
       }
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
@@ -453,14 +487,28 @@ async function handleSyncWithRetry(
     spawnResumeId = handle.session.sessionId;
     prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
+      // Nothing new to send — can't resume, start fresh session
       spawnResumeId = undefined;
+      sessions.invalidateSession(userId);
+      handle = await sessions.acquireSession(userId);
+      handle.session.accountName = account.account.name;
       spawnSessionId = handle.session.sessionId;
       prompt = messagesToPrompt(messages, tools);
+      console.log(
+        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | REFRESH session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
+      );
+    } else {
+      console.log(
+        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+      );
     }
-    console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
-    );
   } else {
+    // Session was used before but can't resume — create fresh session ID
+    if (handle.session.lastMessageCount > 0) {
+      sessions.invalidateSession(userId);
+      handle = await sessions.acquireSession(userId);
+      handle.session.accountName = account.account.name;
+    }
     spawnSessionId = handle.session.sessionId;
     prompt = messagesToPrompt(messages, tools);
     console.log(
@@ -473,6 +521,7 @@ async function handleSyncWithRetry(
   let done = false;
   let fullText = "";
   let rateLimitResetsAt = 0;
+  let sessionCollision = false;
 
   function cleanup() {
     if (done) return;
@@ -495,6 +544,20 @@ async function handleSyncWithRetry(
 
   proc.on("delta", (text: string) => {
     fullText += text;
+  });
+
+  // Capture filtered text from assistant message (thinking blocks already removed in subprocess)
+  proc.on("assistant", (msg: CliAssistantMessage) => {
+    if (!fullText && Array.isArray(msg.message?.content)) {
+      fullText = msg.message.content
+        .filter((b) => b.type === "text" && b.text)
+        .map((b) => b.text!)
+        .join("\n");
+    }
+  });
+
+  proc.on("session_collision", () => {
+    sessionCollision = true;
   });
 
   proc.on("rate_limit", (info: { status: string; resetsAt?: number }) => {
@@ -546,6 +609,8 @@ async function handleSyncWithRetry(
         res.status(500).json({ error: { message: "Claude request failed", type: "server_error" } });
       }
     } else {
+      // Prefer filtered text (thinking stripped) over result.result
+      if (fullText) result.result = fullText;
       const { toolCalls } = parseToolCalls(result.result ?? "");
       sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
       if (!res.headersSent) {
@@ -576,9 +641,13 @@ async function handleSyncWithRetry(
   proc.on("close", (code: number) => {
     if (!done) {
       if (code !== 0 && attempt < MAX_RETRIES - 1) {
-        console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
         sessions.invalidateSession(userId);
-        router.cooldown(account, EXIT_COOLDOWN_MS);
+        if (sessionCollision) {
+          console.error(`[${requestId}] Session collision on ${account.account.name}, retrying with fresh session...`);
+        } else {
+          console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+          router.cooldown(account, EXIT_COOLDOWN_MS);
+        }
         cleanup();
         handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
@@ -588,7 +657,7 @@ async function handleSyncWithRetry(
       }
       if (code !== 0) {
         sessions.invalidateSession(userId);
-        router.cooldown(account, EXIT_COOLDOWN_MS);
+        if (!sessionCollision) router.cooldown(account, EXIT_COOLDOWN_MS);
       }
       if (!res.headersSent) {
         res.status(500).json({ error: { message: `Process exited with code ${code}`, type: "server_error" } });

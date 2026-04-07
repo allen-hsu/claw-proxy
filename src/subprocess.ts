@@ -67,6 +67,8 @@ export class ClaudeProcess extends EventEmitter {
   private timer: NodeJS.Timeout | null = null;
   private killed = false;
   private buffer = "";
+  /** Content block indices that are thinking blocks — their deltas should be skipped */
+  private thinkingBlocks = new Set<number>();
 
   start(prompt: string, options: SpawnOptions): void {
     const args: string[] = [];
@@ -131,7 +133,12 @@ export class ClaudeProcess extends EventEmitter {
 
     this.proc.stderr!.on("data", (chunk: Buffer) => {
       const text = chunk.toString().trim();
-      if (text) console.error(`[Claude stderr] ${text}`);
+      if (text) {
+        console.error(`[Claude stderr] ${text}`);
+        if (text.includes("is already in use")) {
+          this.emit("session_collision");
+        }
+      }
     });
 
     this.proc.on("error", (err) => {
@@ -195,12 +202,31 @@ export class ClaudeProcess extends EventEmitter {
       }
 
       if (parsed.type === "stream_event") {
-        const delta = parsed.event?.delta;
+        const event = parsed.event;
+
+        // Track thinking content blocks so we can skip their deltas
+        if (event?.type === "content_block_start") {
+          if (event.content_block?.type === "thinking") {
+            this.thinkingBlocks.add(event.index);
+          }
+        } else if (event?.type === "content_block_stop") {
+          this.thinkingBlocks.delete(event.index);
+        }
+
+        const delta = event?.delta;
         if (delta?.type === "text_delta" && delta.text) {
-          this.emit("delta", delta.text);
+          // Skip deltas belonging to thinking blocks
+          if (!this.thinkingBlocks.has(event?.index)) {
+            this.emit("delta", delta.text);
+          }
         }
       } else if (parsed.type === "assistant") {
-        // Don't emit delta here — text was already streamed via stream_event deltas
+        // Filter out thinking blocks from assistant content
+        if (Array.isArray(parsed.message?.content)) {
+          parsed.message.content = parsed.message.content.filter(
+            (block: any) => block.type !== "thinking"
+          );
+        }
         this.emit("assistant", parsed as CliAssistantMessage);
       } else if (parsed.type === "rate_limit_event") {
         const info = parsed.rate_limit_info;

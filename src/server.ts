@@ -10,8 +10,6 @@ import {
   type OpenAIToolDef,
   resolveModel,
   messagesToPrompt,
-  messagesToStreamJson,
-  hasImageContent,
   extractNewMessages,
   makeRequestId,
   streamChunk,
@@ -225,13 +223,11 @@ async function handleStreamWithRetry(
 
   // Decide resume vs new
   const canResume = handle.isResume && !accountChanged && handle.session.lastMessageCount < messages.length;
-  const useStreamJson = hasImageContent(messages);
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
-  if (canResume && !useStreamJson) {
-    // Resume with text-only delta (stream-json doesn't support resume well)
+  if (canResume) {
     spawnResumeId = handle.session.sessionId;
     prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
@@ -244,11 +240,9 @@ async function handleStreamWithRetry(
     );
   } else {
     spawnSessionId = handle.session.sessionId;
-    prompt = useStreamJson
-      ? messagesToStreamJson(messages, tools)
-      : messagesToPrompt(messages, tools);
+    prompt = messagesToPrompt(messages, tools);
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}${useStreamJson ? " [multimodal]" : ""}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
     );
   }
 
@@ -412,7 +406,6 @@ async function handleStreamWithRetry(
     signal: abort.signal,
     sessionId: spawnSessionId,
     resumeId: spawnResumeId,
-    streamJsonInput: useStreamJson,
   });
 }
 
@@ -456,9 +449,7 @@ async function handleSyncWithRetry(
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
-  const useStreamJson = hasImageContent(messages);
-
-  if (canResume && !useStreamJson) {
+  if (canResume) {
     spawnResumeId = handle.session.sessionId;
     prompt = extractNewMessages(messages, handle.session.lastMessageCount);
     if (!prompt) {
@@ -471,11 +462,9 @@ async function handleSyncWithRetry(
     );
   } else {
     spawnSessionId = handle.session.sessionId;
-    prompt = useStreamJson
-      ? messagesToStreamJson(messages, tools)
-      : messagesToPrompt(messages, tools);
+    prompt = messagesToPrompt(messages, tools);
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}${useStreamJson ? " [multimodal]" : ""}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
     );
   }
 
@@ -616,6 +605,5 @@ async function handleSyncWithRetry(
     signal: abort.signal,
     sessionId: spawnSessionId,
     resumeId: spawnResumeId,
-    streamJsonInput: useStreamJson,
   });
 }

@@ -13,8 +13,6 @@ export interface SpawnOptions {
   sessionId?: string;
   /** Resume an existing session (subsequent requests) */
   resumeId?: string;
-  /** Use stream-json input format (required for image support) */
-  streamJsonInput?: boolean;
 }
 
 export interface CliAssistantMessage {
@@ -98,10 +96,6 @@ export class ClaudeProcess extends EventEmitter {
       "--system-prompt",
       "",
     );
-
-    if (options.streamJsonInput) {
-      args.push("--input-format", "stream-json");
-    }
 
     const env: Record<string, string | undefined> = { ...process.env };
 

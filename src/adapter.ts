@@ -262,7 +262,11 @@ export function parseToolCalls(text: string): {
     }
   }
 
-  const cleanText = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+  const cleanText = text
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+    .replace(/<tool_result[\s\S]*?<\/tool_result>/g, "")
+    .replace(/<previous_response>[\s\S]*?<\/previous_response>/g, "")
+    .trim();
 
   return { cleanText, toolCalls };
 }

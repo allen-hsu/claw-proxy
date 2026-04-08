@@ -377,9 +377,9 @@ async function handleStreamWithRetry(
       res.write(streamChunk(requestId, model, null, "stop"));
     }
 
+    cleanup();  // Mark done BEFORE res.end() to prevent close handler from invalidating session
     res.write("data: [DONE]\n\n");
     res.end();
-    cleanup();
   });
 
   proc.on("error", (err: Error) => {
@@ -394,12 +394,12 @@ async function handleStreamWithRetry(
       });
       return;
     }
+    cleanup();
     if (!res.writableEnded) {
       res.write(`data: ${JSON.stringify({ error: { message: "Internal error", type: "server_error" } })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
     }
-    cleanup();
   });
 
   proc.on("close", (code: number) => {
@@ -424,11 +424,11 @@ async function handleStreamWithRetry(
         sessions.invalidateSession(userId);
         if (!sessionCollision) router.cooldown(account, EXIT_COOLDOWN_MS);
       }
+      cleanup();
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      cleanup();
     }
   });
 
@@ -605,19 +605,22 @@ async function handleSyncWithRetry(
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
       else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
-      if (!res.headersSent) {
-        res.status(500).json({ error: { message: "Claude request failed", type: "server_error" } });
-      }
     } else {
       // Prefer filtered text (thinking stripped) over result.result
       if (fullText) result.result = fullText;
       const { toolCalls } = parseToolCalls(result.result ?? "");
       sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
+    }
+    cleanup();  // Mark done BEFORE sending response to prevent close handler from invalidating session
+    if (result.is_error) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: "Claude request failed", type: "server_error" } });
+      }
+    } else {
       if (!res.headersSent) {
         res.json(completionResponse(requestId, model, result));
       }
     }
-    cleanup();
   });
 
   proc.on("error", (err: Error) => {
@@ -632,10 +635,10 @@ async function handleSyncWithRetry(
       });
       return;
     }
+    cleanup();
     if (!res.headersSent) {
       res.status(500).json({ error: { message: "Internal error", type: "server_error" } });
     }
-    cleanup();
   });
 
   proc.on("close", (code: number) => {
@@ -659,10 +662,10 @@ async function handleSyncWithRetry(
         sessions.invalidateSession(userId);
         if (!sessionCollision) router.cooldown(account, EXIT_COOLDOWN_MS);
       }
+      cleanup();
       if (!res.headersSent) {
         res.status(500).json({ error: { message: `Process exited with code ${code}`, type: "server_error" } });
       }
-      cleanup();
     }
   });
 

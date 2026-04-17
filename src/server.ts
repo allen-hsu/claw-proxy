@@ -34,9 +34,19 @@ function isAuthError(text: string): boolean {
   );
 }
 
-function isRateLimit(text: string): boolean {
+export function isRateLimit(text: string): boolean {
   const lower = text.toLowerCase();
-  return lower.includes("rate_limit") || lower.includes("rate limit") || lower.includes("overloaded") || lower.includes("too many requests");
+  return (
+    lower.includes("rate_limit") ||
+    lower.includes("rate limit") ||
+    lower.includes("overloaded") ||
+    lower.includes("too many requests") ||
+    lower.includes("you've hit your limit") ||
+    lower.includes("out of extra usage") ||
+    lower.includes("usage limit") ||
+    lower.includes("llm request rejected") ||
+    (lower.includes("hit your limit") && lower.includes("resets"))
+  );
 }
 
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;

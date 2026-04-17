@@ -15,7 +15,8 @@ git clone https://github.com/allen-hsu/claw-proxy.git
 cd claw-proxy
 npm install && npm run build
 
-# First run generates ~/.claw-proxy/config.json with a random bearer token
+# First run generates ~/.claw-proxy/config.json with a random bearer token.
+# The server will exit until you replace the placeholder account tokens.
 npm start
 ```
 
@@ -42,6 +43,17 @@ Paste tokens into `~/.claw-proxy/config.json`:
   ],
   "timeoutMs": 900000,
   "defaultModel": "sonnet"
+}
+```
+
+`oauthToken` is the default. You can also use `configDir` for an account if you want the proxy to reuse an existing Claude CLI login directory instead of a long-lived token:
+
+```json
+{
+  "accounts": [
+    { "name": "account-1", "oauthToken": "<token from account A>" },
+    { "name": "account-2", "configDir": "/path/to/claude-config-dir" }
+  ]
 }
 ```
 
@@ -118,6 +130,7 @@ For best prompt-cache reuse, send a stable conversation identifier in either the
 | `claude-sonnet-4` | Claude Sonnet 4 |
 | `claude-opus-4` | Claude Opus 4 |
 | `claude-haiku-4` | Claude Haiku 4 |
+| `claude-haiku-4-5` | Claude Haiku 4.5 |
 | `claude-sonnet-4-5` | Claude Sonnet 4.5 |
 | `claude-sonnet-4-6` | Claude Sonnet 4.6 |
 | `claude-opus-4-6` | Claude Opus 4.6 |
@@ -126,7 +139,9 @@ Models can also be prefixed with `openai/` (e.g. `openai/claude-sonnet-4`) for O
 
 ## Account Rotation
 
-Accounts rotate round-robin. When an account hits a rate limit, it's automatically cooled down and skipped for 60 seconds. The next available account picks up.
+Accounts use a fill-first strategy, not round-robin. The proxy keeps sending traffic to the first available account to maximize prompt-cache reuse, and only moves to the next account when the current one is in cooldown.
+
+When an account hits a rate limit or usage cap, it is automatically cooled down and skipped until another account is available.
 
 ```bash
 # Check account status
@@ -154,14 +169,6 @@ sudo systemctl enable claw-proxy@$USER
 sudo systemctl start claw-proxy@$USER
 ```
 
-### PM2
-
-```bash
-npm install -g pm2
-pm2 start dist/index.js --name claw-proxy
-pm2 save && pm2 startup
-```
-
 ## Configuration Reference
 
 `~/.claw-proxy/config.json` (or `./data/config.json` for Docker):
@@ -171,7 +178,7 @@ pm2 save && pm2 startup
 | `port` | `3456` | Server port. Override with `PORT` env var. |
 | `host` | `127.0.0.1` | Bind address. Override with `HOST` env var. Use `0.0.0.0` in Docker. |
 | `bearerToken` | auto-generated | API key for authenticating requests to the proxy. |
-| `accounts` | — | Array of `{ name, oauthToken }` for each Claude Max account. |
+| `accounts` | — | Array of accounts. Each account must provide either `{ name, oauthToken }` or `{ name, configDir }`. |
 | `timeoutMs` | `900000` | Max time per request (15 min). |
 | `defaultModel` | `sonnet` | Fallback model when the requested model is not in the map. |
 
@@ -191,7 +198,7 @@ src/
 ├── index.ts        # Entry point — start server or --setup
 ├── config.ts       # ~/.claw-proxy/config.json management
 ├── server.ts       # Express — /v1/chat/completions, /health, /v1/models
-├── router.ts       # Round-robin account rotation + cooldown
+├── router.ts       # Fill-first account routing + cooldown
 ├── subprocess.ts   # spawn claude -p + NDJSON stream parser
 └── adapter.ts      # OpenAI ↔ Claude CLI format conversion
 ```

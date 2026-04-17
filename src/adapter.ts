@@ -235,6 +235,15 @@ export interface ParsedToolCall {
   function: { name: string; arguments: string };
 }
 
+export function sanitizeAssistantText(text: string): string {
+  return text
+    .replace(/```(?:xml|html|markdown)?\s*<tool_call>[\s\S]*?<\/tool_call>\s*```/gi, "")
+    .replace(/<(thinking|analysis|reasoning|scratchpad)>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<(tool_result|previous_response)[\s\S]*?<\/(tool_result|previous_response)>/gi, "")
+    .replace(/^\s*(thinking|analysis|reasoning|scratchpad)\s*:\s*.*$/gim, "")
+    .trim();
+}
+
 export function parseToolCalls(text: string): {
   cleanText: string;
   toolCalls: ParsedToolCall[];
@@ -262,10 +271,8 @@ export function parseToolCalls(text: string): {
     }
   }
 
-  const cleanText = text
+  const cleanText = sanitizeAssistantText(text)
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-    .replace(/<tool_result[\s\S]*?<\/tool_result>/g, "")
-    .replace(/<previous_response>[\s\S]*?<\/previous_response>/g, "")
     .trim();
 
   return { cleanText, toolCalls };

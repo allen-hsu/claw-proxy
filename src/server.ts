@@ -243,6 +243,53 @@ export function createServer(config: Config) {
   return app;
 }
 
+function sendAccountUnavailableResponse(
+  res: Response,
+  router: AccountRouter,
+  stream: boolean
+): void {
+  const unavailable = router.unavailableInfo();
+
+  if (unavailable.reason === "cooldown") {
+    const retryAfterSeconds = Math.max(1, Math.ceil(unavailable.retryAfterMs / 1000));
+    const payload = {
+      error: {
+        message: "All Claude accounts are temporarily rate-limited. Please retry later.",
+        type: "all_accounts_rate_limited",
+      },
+      retry_after_seconds: retryAfterSeconds,
+    };
+
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+
+    if (stream && res.headersSent) {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+
+    res.status(429).json(payload);
+    return;
+  }
+
+  const payload = {
+    error: {
+      message: "No Claude accounts are configured or available.",
+      type: "server_error",
+    },
+  };
+
+  if (stream && res.headersSent) {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  res.status(503).json(payload);
+}
+
 // --- Streaming with retry ---
 
 async function handleStreamWithRetry(
@@ -264,11 +311,7 @@ async function handleStreamWithRetry(
   const maybeAccount = router.acquire(userId);
   if (!maybeAccount) {
     handle.release();
-    if (!res.headersSent) {
-      res.status(503).json({
-        error: { message: "No accounts available", type: "server_error" },
-      });
-    }
+    sendAccountUnavailableResponse(res, router, true);
     return;
   }
   const account = maybeAccount;
@@ -524,11 +567,7 @@ async function handleSyncWithRetry(
   const maybeAccount = router.acquire(userId);
   if (!maybeAccount) {
     handle.release();
-    if (!res.headersSent) {
-      res.status(503).json({
-        error: { message: "No accounts available", type: "server_error" },
-      });
-    }
+    sendAccountUnavailableResponse(res, router, false);
     return;
   }
   const account = maybeAccount;

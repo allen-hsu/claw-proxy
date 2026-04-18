@@ -6,6 +6,11 @@ export interface AccountState {
   activeRequests: number;
 }
 
+export interface RouterUnavailableInfo {
+  reason: "cooldown" | "empty";
+  retryAfterMs: number;
+}
+
 /**
  * Fill-first account router with sticky sessions.
  *
@@ -63,6 +68,25 @@ export class AccountRouter {
 
     // All in cooldown — return null
     return null;
+  }
+
+  unavailableInfo(): RouterUnavailableInfo {
+    const now = Date.now();
+
+    if (this.states.length === 0) {
+      return { reason: "empty", retryAfterMs: 0 };
+    }
+
+    const cooldownStates = this.states.filter((state) => state.cooldownUntil > now);
+    if (cooldownStates.length === this.states.length) {
+      const soonestReadyAt = Math.min(...cooldownStates.map((state) => state.cooldownUntil));
+      return {
+        reason: "cooldown",
+        retryAfterMs: Math.max(0, soonestReadyAt - now),
+      };
+    }
+
+    return { reason: "empty", retryAfterMs: 0 };
   }
 
   /** Remove sticky entries older than TTL or enforce max size. */

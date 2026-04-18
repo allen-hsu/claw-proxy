@@ -1,3 +1,4 @@
+import type { MessageSnapshot } from "./adapter.js";
 import { v4 as uuid } from "uuid";
 
 export interface SessionEntry {
@@ -5,6 +6,7 @@ export interface SessionEntry {
   accountName: string;
   toolCallIds: Set<string>;
   lastMessageCount: number;
+  messageSnapshot: MessageSnapshot;
   createdAt: number;
   lastUsedAt: number;
   /** Whether a claude process is currently using this session */
@@ -48,6 +50,7 @@ export class SessionManager {
         accountName: "",
         toolCallIds: new Set(),
         lastMessageCount: 0,
+        messageSnapshot: [],
         createdAt: Date.now(),
         lastUsedAt: Date.now(),
         busy: true,
@@ -74,6 +77,7 @@ export class SessionManager {
             accountName: "",
             toolCallIds: new Set(),
             lastMessageCount: 0,
+            messageSnapshot: [],
             createdAt: Date.now(),
             lastUsedAt: Date.now(),
             busy: true,
@@ -125,7 +129,8 @@ export class SessionManager {
   updateSession(
     userId: string,
     toolCallIds: string[],
-    messageCount: number
+    messageCount: number,
+    messageSnapshot: MessageSnapshot
   ): void {
     const session = this.sessionsByUser.get(userId);
     if (!session) return;
@@ -142,6 +147,7 @@ export class SessionManager {
     }
 
     session.lastMessageCount = messageCount;
+    session.messageSnapshot = [...messageSnapshot];
     session.lastUsedAt = Date.now();
   }
 

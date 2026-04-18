@@ -28,7 +28,7 @@ async function run() {
     const sm = new SessionManager();
     const h1 = await sm.acquireSession("user1");
     h1.session.accountName = "acct1";
-    sm.updateSession("user1", ["tc1"], 5);
+    sm.updateSession("user1", ["tc1"], 5, ["m1", "m2", "m3", "m4", "m5"]);
     h1.release();
 
     const h2 = await sm.acquireSession("user1");
@@ -185,7 +185,7 @@ async function run() {
     const h1 = await sm.acquireSession("user1");
 
     // Update with some tool call IDs
-    sm.updateSession("user1", ["tc1", "tc2"], 3);
+    sm.updateSession("user1", ["tc1", "tc2"], 3, ["m1", "m2", "m3"]);
 
     // Should be able to look up by tool call ID
     const found1 = sm.getSessionByToolCallId("tc1");
@@ -196,7 +196,7 @@ async function run() {
     assert.ok(found2, "tc2 should map to a session");
 
     // Update again with new IDs — old ones should be unmapped
-    sm.updateSession("user1", ["tc3"], 5);
+    sm.updateSession("user1", ["tc3"], 5, ["m1", "m2", "m3", "m4", "m5"]);
 
     const oldLookup = sm.getSessionByToolCallId("tc1");
     assert.equal(oldLookup, null, "tc1 should be unmapped after update");

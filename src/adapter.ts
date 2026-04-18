@@ -52,6 +52,8 @@ export function resolveModel(model: string, defaultModel: string): string {
   return MODEL_MAP[model] ?? defaultModel;
 }
 
+export type MessageSnapshot = string[];
+
 function extractText(content: OpenAIMessage["content"]): string {
   if (typeof content === "string") return content;
   if (!content) return "";
@@ -59,6 +61,63 @@ function extractText(content: OpenAIMessage["content"]): string {
     .filter((p) => p.type === "text" && p.text)
     .map((p) => p.text!)
     .join("\n");
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalizeMessage(message: OpenAIMessage): string {
+  const normalizedContent =
+    typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content.map((part) => ({
+            type: part.type,
+            text: part.text ?? null,
+          }))
+        : null;
+
+  const normalizedToolCalls = Array.isArray(message.tool_calls)
+    ? message.tool_calls.map((toolCall) => ({
+        id: toolCall.id,
+        type: toolCall.type,
+        function: {
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments,
+        },
+      }))
+    : undefined;
+
+  return stableJson({
+    role: message.role,
+    name: message.name,
+    tool_call_id: message.tool_call_id,
+    content: normalizedContent,
+    tool_calls: normalizedToolCalls,
+  });
+}
+
+export function snapshotMessages(messages: OpenAIMessage[]): MessageSnapshot {
+  return messages.map((message) => canonicalizeMessage(message));
+}
+
+export function isMessagePrefix(
+  previousSnapshot: MessageSnapshot,
+  nextMessages: OpenAIMessage[]
+): boolean {
+  if (previousSnapshot.length > nextMessages.length) return false;
+  const nextSnapshot = snapshotMessages(nextMessages);
+  return previousSnapshot.every((message, index) => message === nextSnapshot[index]);
 }
 
 // --- Gateway-internal tools that should not be listed ---
@@ -225,6 +284,16 @@ export function extractNewMessages(
   }
 
   return parts.join("\n\n");
+}
+
+export function buildResumePrompt(
+  messages: OpenAIMessage[],
+  previousSnapshot: MessageSnapshot
+): string | null {
+  if (previousSnapshot.length === 0) return null;
+  if (!isMessagePrefix(previousSnapshot, messages)) return null;
+  if (previousSnapshot.length >= messages.length) return null;
+  return extractNewMessages(messages, previousSnapshot.length);
 }
 
 // --- Parse <tool_call> blocks from Claude's response ---

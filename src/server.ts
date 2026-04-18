@@ -3,18 +3,20 @@ import express, { type Request, type Response } from "express";
 import type { Config } from "./config.js";
 import { AccountRouter, type AccountState } from "./router.js";
 import { ClaudeProcess, type CliAssistantMessage, type CliResultMessage } from "./subprocess.js";
-import { SessionManager } from "./session.js";
+import { SessionManager, type SessionEntry } from "./session.js";
 import {
   type OpenAIRequest,
   type OpenAIMessage,
   type OpenAIToolDef,
   resolveModel,
   messagesToPrompt,
-  extractNewMessages,
+  buildResumePrompt,
   makeRequestId,
   streamChunk,
   completionResponse,
   parseToolCalls,
+  snapshotMessages,
+  isMessagePrefix,
 } from "./adapter.js";
 
 const MAX_RETRIES = 3;
@@ -58,6 +60,20 @@ const SESSION_HEADER_CANDIDATES = [
   "openai-conversation-id",
 ] as const;
 
+export interface SessionIdentityInfo {
+  key: string;
+  source: "user" | "header" | "fallback";
+  detail: string;
+}
+
+export type ResumeDecisionReason =
+  | "new_session"
+  | "resumed"
+  | "account_changed"
+  | "empty_snapshot"
+  | "prefix_mismatch"
+  | "no_growth";
+
 function firstTextBlock(msg: OpenAIMessage): string {
   if (typeof msg.content === "string") return msg.content;
   if (!Array.isArray(msg.content)) return "";
@@ -84,18 +100,52 @@ function makeConversationFingerprint(messages: OpenAIMessage[]): string {
   return createHash("sha1").update(seed).digest("hex").slice(0, 16);
 }
 
-export function resolveSessionKey(req: Request, body: OpenAIRequest): string {
+export function inspectSessionIdentity(req: Request, body: OpenAIRequest): SessionIdentityInfo {
   const explicitUser = typeof body.user === "string" ? body.user.trim() : "";
-  if (explicitUser) return `user:${explicitUser}`;
+  if (explicitUser) {
+    return {
+      key: `user:${explicitUser}`,
+      source: "user",
+      detail: explicitUser,
+    };
+  }
 
   for (const header of SESSION_HEADER_CANDIDATES) {
     const value = req.header(header)?.trim();
-    if (value) return `header:${header}:${value}`;
+    if (value) {
+      return {
+        key: `header:${header}:${value}`,
+        source: "header",
+        detail: `${header}=${value}`,
+      };
+    }
   }
 
   const ip = req.ip || "unknown";
   const fingerprint = makeConversationFingerprint(body.messages ?? []);
-  return `ip:${ip}:fp:${fingerprint}`;
+  return {
+    key: `ip:${ip}:fp:${fingerprint}`,
+    source: "fallback",
+    detail: `ip=${ip} fingerprint=${fingerprint}`,
+  };
+}
+
+export function resolveSessionKey(req: Request, body: OpenAIRequest): string {
+  return inspectSessionIdentity(req, body).key;
+}
+
+export function getResumeDecision(
+  session: SessionEntry,
+  messages: OpenAIMessage[],
+  accountChanged: boolean,
+  isResume: boolean
+): ResumeDecisionReason {
+  if (!isResume) return "new_session";
+  if (accountChanged) return "account_changed";
+  if (session.messageSnapshot.length === 0) return "empty_snapshot";
+  if (!isMessagePrefix(session.messageSnapshot, messages)) return "prefix_mismatch";
+  if (session.messageSnapshot.length >= messages.length) return "no_growth";
+  return "resumed";
 }
 
 export function createServer(config: Config) {
@@ -171,10 +221,11 @@ export function createServer(config: Config) {
 
     const requestId = makeRequestId();
     const model = resolveModel(body.model, config.defaultModel);
-    const userId = resolveSessionKey(req, body);
+    const identity = inspectSessionIdentity(req, body);
+    const userId = identity.key;
 
     console.log(
-      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | messages=${body.messages.length}`
+      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | identity=${identity.source}:${identity.detail} | messages=${body.messages.length}`
     );
 
     if (body.stream) {
@@ -232,31 +283,27 @@ async function handleStreamWithRetry(
   handle.session.accountName = account.account.name;
 
   // Decide resume vs new
-  const canResume = handle.isResume && !accountChanged && handle.session.lastMessageCount < messages.length;
+  const resumeDecision = getResumeDecision(handle.session, messages, accountChanged, handle.isResume);
+  const resumePrompt = resumeDecision === "resumed"
+    ? buildResumePrompt(messages, handle.session.messageSnapshot)
+    : null;
+  const canResume = resumePrompt !== null;
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
   if (canResume) {
     spawnResumeId = handle.session.sessionId;
-    prompt = extractNewMessages(messages, handle.session.lastMessageCount);
-    if (!prompt) {
-      // Nothing new to send — can't resume, start fresh session
-      spawnResumeId = undefined;
-      sessions.invalidateSession(userId);
-      handle = await sessions.acquireSession(userId);
-      handle.session.accountName = account.account.name;
-      spawnSessionId = handle.session.sessionId;
-      prompt = messagesToPrompt(messages, tools);
+    prompt = resumePrompt;
+    console.log(
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+    );
+  } else {
+    if (handle.isResume) {
       console.log(
-        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | REFRESH session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
-      );
-    } else {
-      console.log(
-        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | resume_rejected=${resumeDecision} | prev_messages=${handle.session.messageSnapshot.length} | messages=${messages.length}`
       );
     }
-  } else {
     // Session was used before but can't resume — create fresh session ID
     if (handle.session.lastMessageCount > 0) {
       sessions.invalidateSession(userId);
@@ -374,7 +421,12 @@ async function handleStreamWithRetry(
     const { cleanText, toolCalls } = parseToolCalls(responseText);
 
     if (!result.is_error) {
-      sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
+      sessions.updateSession(
+        userId,
+        toolCalls.map((tc) => tc.id),
+        messages.length,
+        snapshotMessages(messages)
+      );
     }
 
     if (toolCalls.length > 0) {
@@ -488,31 +540,27 @@ async function handleSyncWithRetry(
   }
   handle.session.accountName = account.account.name;
 
-  const canResume = handle.isResume && !accountChanged && handle.session.lastMessageCount < messages.length;
+  const resumeDecision = getResumeDecision(handle.session, messages, accountChanged, handle.isResume);
+  const resumePrompt = resumeDecision === "resumed"
+    ? buildResumePrompt(messages, handle.session.messageSnapshot)
+    : null;
+  const canResume = resumePrompt !== null;
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
 
   if (canResume) {
     spawnResumeId = handle.session.sessionId;
-    prompt = extractNewMessages(messages, handle.session.lastMessageCount);
-    if (!prompt) {
-      // Nothing new to send — can't resume, start fresh session
-      spawnResumeId = undefined;
-      sessions.invalidateSession(userId);
-      handle = await sessions.acquireSession(userId);
-      handle.session.accountName = account.account.name;
-      spawnSessionId = handle.session.sessionId;
-      prompt = messagesToPrompt(messages, tools);
+    prompt = resumePrompt;
+    console.log(
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+    );
+  } else {
+    if (handle.isResume) {
       console.log(
-        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | REFRESH session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
-      );
-    } else {
-      console.log(
-        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+        `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | resume_rejected=${resumeDecision} | prev_messages=${handle.session.messageSnapshot.length} | messages=${messages.length}`
       );
     }
-  } else {
     // Session was used before but can't resume — create fresh session ID
     if (handle.session.lastMessageCount > 0) {
       sessions.invalidateSession(userId);
@@ -619,7 +667,12 @@ async function handleSyncWithRetry(
       // Prefer filtered text (thinking stripped) over result.result
       if (fullText) result.result = fullText;
       const { toolCalls } = parseToolCalls(result.result ?? "");
-      sessions.updateSession(userId, toolCalls.map((tc) => tc.id), messages.length);
+      sessions.updateSession(
+        userId,
+        toolCalls.map((tc) => tc.id),
+        messages.length,
+        snapshotMessages(messages)
+      );
     }
     cleanup();  // Mark done BEFORE sending response to prevent close handler from invalidating session
     if (result.is_error) {

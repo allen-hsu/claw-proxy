@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { Request } from "express";
-import { resolveSessionKey } from "./server.js";
+import { inspectSessionIdentity, resolveSessionKey } from "./server.js";
 import type { OpenAIRequest } from "./adapter.js";
 
 function makeRequest(headers: Record<string, string | undefined>, ip = "127.0.0.1"): Request {
@@ -47,6 +47,15 @@ test("uses session header before IP fallback", () => {
     makeBody([{ role: "user", content: "Hello" }])
   );
   assert.equal(key, "header:x-session-id:sess-abc");
+});
+
+test("identity inspection reports fallback source details", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "10.0.0.9"),
+    makeBody([{ role: "user", content: "Conversation A" }])
+  );
+  assert.equal(identity.source, "fallback");
+  assert.match(identity.detail, /ip=10\.0\.0\.9 fingerprint=/);
 });
 
 test("same conversation on same IP gets stable fallback key", () => {

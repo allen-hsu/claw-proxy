@@ -54,6 +54,7 @@ export function isRateLimit(text: string): boolean {
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
 const SESSION_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
 const SESSION_HEADER_CANDIDATES = [
+  "x-openclaw-session-key",
   "x-session-id",
   "x-conversation-id",
   "x-thread-id",
@@ -64,6 +65,10 @@ export interface SessionIdentityInfo {
   key: string;
   source: "user" | "header" | "fallback";
   detail: string;
+}
+
+function identityAllowsResume(identity: SessionIdentityInfo): boolean {
+  return identity.source === "header";
 }
 
 export type ResumeDecisionReason =
@@ -101,15 +106,8 @@ function makeConversationFingerprint(messages: OpenAIMessage[]): string {
 }
 
 export function inspectSessionIdentity(req: Request, body: OpenAIRequest): SessionIdentityInfo {
-  const explicitUser = typeof body.user === "string" ? body.user.trim() : "";
-  if (explicitUser) {
-    return {
-      key: `user:${explicitUser}`,
-      source: "user",
-      detail: explicitUser,
-    };
-  }
-
+  // Prefer explicit conversation-scoped headers before body.user so OpenClaw
+  // sessions do not collapse when a client reuses one user value across chats.
   for (const header of SESSION_HEADER_CANDIDATES) {
     const value = req.header(header)?.trim();
     if (value) {
@@ -119,6 +117,16 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
         detail: `${header}=${value}`,
       };
     }
+  }
+
+  const explicitUser = typeof body.user === "string" ? body.user.trim() : "";
+  if (explicitUser) {
+    const fingerprint = makeConversationFingerprint(body.messages ?? []);
+    return {
+      key: `user:${explicitUser}:fp:${fingerprint}`,
+      source: "user",
+      detail: `${explicitUser} fingerprint=${fingerprint}`,
+    };
   }
 
   const ip = req.ip || "unknown";
@@ -223,15 +231,42 @@ export function createServer(config: Config) {
     const model = resolveModel(body.model, config.defaultModel);
     const identity = inspectSessionIdentity(req, body);
     const userId = identity.key;
+    const allowResume = identityAllowsResume(identity);
 
     console.log(
-      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | user=${userId} | identity=${identity.source}:${identity.detail} | messages=${body.messages.length}`
+      `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | sessionKey=${userId} | identity=${identity.source}:${identity.detail} | resume=${allowResume ? "on" : "off"} | messages=${body.messages.length}`
     );
 
     if (body.stream) {
-      await handleStreamWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
+      await handleStreamWithRetry(
+        res,
+        requestId,
+        model,
+        body.messages,
+        body.tools,
+        config,
+        router,
+        sessions,
+        0,
+        userId,
+        allowResume,
+        identity.source
+      );
     } else {
-      await handleSyncWithRetry(res, requestId, model, body.messages, body.tools, config, router, sessions, 0, userId);
+      await handleSyncWithRetry(
+        res,
+        requestId,
+        model,
+        body.messages,
+        body.tools,
+        config,
+        router,
+        sessions,
+        0,
+        userId,
+        allowResume,
+        identity.source
+      );
     }
   });
 
@@ -302,7 +337,9 @@ async function handleStreamWithRetry(
   router: AccountRouter,
   sessions: SessionManager,
   attempt: number,
-  userId: string
+  userId: string,
+  allowResume: boolean,
+  identitySource: SessionIdentityInfo["source"]
 ): Promise<void> {
   // 1. Acquire session lock first (may wait if session is busy)
   let handle = await sessions.acquireSession(userId);
@@ -324,9 +361,15 @@ async function handleStreamWithRetry(
     handle = await sessions.acquireSession(userId);
   }
   handle.session.accountName = account.account.name;
+  sessions.updateMetadata(userId, { identitySource, allowResume });
 
   // Decide resume vs new
-  const resumeDecision = getResumeDecision(handle.session, messages, accountChanged, handle.isResume);
+  const resumeDecision = getResumeDecision(
+    handle.session,
+    messages,
+    accountChanged,
+    allowResume && handle.isResume
+  );
   const resumePrompt = resumeDecision === "resumed"
     ? buildResumePrompt(messages, handle.session.messageSnapshot)
     : null;
@@ -352,6 +395,7 @@ async function handleStreamWithRetry(
       sessions.invalidateSession(userId);
       handle = await sessions.acquireSession(userId);
       handle.session.accountName = account.account.name;
+      sessions.updateMetadata(userId, { identitySource, allowResume });
     }
     spawnSessionId = handle.session.sessionId;
     prompt = messagesToPrompt(messages, tools);
@@ -436,7 +480,7 @@ async function handleStreamWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         cleanup();
-        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
           if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
         });
@@ -447,7 +491,7 @@ async function handleStreamWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         cleanup();
-        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
           if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
         });
@@ -493,7 +537,7 @@ async function handleStreamWithRetry(
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       cleanup();
-      handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+      handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
         console.error(`[${requestId}] Retry failed: ${err.message}`);
         if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
       });
@@ -519,7 +563,7 @@ async function handleStreamWithRetry(
           router.cooldown(account, EXIT_COOLDOWN_MS);
         }
         cleanup();
-        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
           if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
         });
@@ -560,7 +604,9 @@ async function handleSyncWithRetry(
   router: AccountRouter,
   sessions: SessionManager,
   attempt: number,
-  userId: string
+  userId: string,
+  allowResume: boolean,
+  identitySource: SessionIdentityInfo["source"]
 ): Promise<void> {
   let handle = await sessions.acquireSession(userId);
 
@@ -578,8 +624,14 @@ async function handleSyncWithRetry(
     handle = await sessions.acquireSession(userId);
   }
   handle.session.accountName = account.account.name;
+  sessions.updateMetadata(userId, { identitySource, allowResume });
 
-  const resumeDecision = getResumeDecision(handle.session, messages, accountChanged, handle.isResume);
+  const resumeDecision = getResumeDecision(
+    handle.session,
+    messages,
+    accountChanged,
+    allowResume && handle.isResume
+  );
   const resumePrompt = resumeDecision === "resumed"
     ? buildResumePrompt(messages, handle.session.messageSnapshot)
     : null;
@@ -605,6 +657,7 @@ async function handleSyncWithRetry(
       sessions.invalidateSession(userId);
       handle = await sessions.acquireSession(userId);
       handle.session.accountName = account.account.name;
+      sessions.updateMetadata(userId, { identitySource, allowResume });
     }
     spawnSessionId = handle.session.sessionId;
     prompt = messagesToPrompt(messages, tools);
@@ -680,7 +733,7 @@ async function handleSyncWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         cleanup();
-        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
           if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
         });
@@ -691,7 +744,7 @@ async function handleSyncWithRetry(
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         cleanup();
-        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
           if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
         });
@@ -731,7 +784,7 @@ async function handleSyncWithRetry(
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       cleanup();
-      handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+      handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
         console.error(`[${requestId}] Retry failed: ${err.message}`);
         if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
       });
@@ -754,7 +807,7 @@ async function handleSyncWithRetry(
           router.cooldown(account, EXIT_COOLDOWN_MS);
         }
         cleanup();
-        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId).catch((err) => {
+        handleSyncWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
           if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
         });

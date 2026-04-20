@@ -4,6 +4,8 @@ import { v4 as uuid } from "uuid";
 export interface SessionEntry {
   sessionId: string;
   accountName: string;
+  identitySource?: "user" | "header" | "fallback";
+  allowResume?: boolean;
   toolCallIds: Set<string>;
   lastMessageCount: number;
   messageSnapshot: MessageSnapshot;
@@ -48,6 +50,8 @@ export class SessionManager {
       session = {
         sessionId: uuid(),
         accountName: "",
+        identitySource: undefined,
+        allowResume: undefined,
         toolCallIds: new Set(),
         lastMessageCount: 0,
         messageSnapshot: [],
@@ -75,6 +79,8 @@ export class SessionManager {
           session = {
             sessionId: uuid(),
             accountName: "",
+            identitySource: undefined,
+            allowResume: undefined,
             toolCallIds: new Set(),
             lastMessageCount: 0,
             messageSnapshot: [],
@@ -151,6 +157,17 @@ export class SessionManager {
     session.lastUsedAt = Date.now();
   }
 
+  updateMetadata(
+    userId: string,
+    metadata: { identitySource: "user" | "header" | "fallback"; allowResume: boolean }
+  ): void {
+    const session = this.sessionsByUser.get(userId);
+    if (!session) return;
+    session.identitySource = metadata.identitySource;
+    session.allowResume = metadata.allowResume;
+    session.lastUsedAt = Date.now();
+  }
+
   /** Invalidate and remove a session. Wakes queued waiters (they'll create new sessions). */
   invalidateSession(userId: string): void {
     const session = this.sessionsByUser.get(userId);
@@ -188,10 +205,31 @@ export class SessionManager {
   }
 
   /** Get status for health endpoint. */
-  status(): { active: number; users: string[] } {
+  status(): {
+    active: number;
+    users: string[];
+    entries: Array<{
+      key: string;
+      sessionId: string;
+      busy: boolean;
+      accountName: string;
+      identitySource?: "user" | "header" | "fallback";
+      allowResume?: boolean;
+      lastUsedAt: number;
+    }>;
+  } {
     return {
       active: this.sessionsByUser.size,
       users: Array.from(this.sessionsByUser.keys()),
+      entries: Array.from(this.sessionsByUser.entries()).map(([key, session]) => ({
+        key,
+        sessionId: session.sessionId,
+        busy: session.busy,
+        accountName: session.accountName,
+        identitySource: session.identitySource,
+        allowResume: session.allowResume,
+        lastUsedAt: session.lastUsedAt,
+      })),
     };
   }
 }

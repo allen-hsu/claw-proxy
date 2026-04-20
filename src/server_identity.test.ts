@@ -33,12 +33,20 @@ function test(name: string, fn: () => void) {
 
 console.log("Session key tests\n");
 
-test("prefers body.user when provided", () => {
+test("prefers openclaw session header over body.user when provided", () => {
+  const key = resolveSessionKey(
+    makeRequest({ "x-openclaw-session-key": "agent:main:chat:123" }, "10.0.0.1"),
+    makeBody([{ role: "user", content: "Hello" }], "agent-123")
+  );
+  assert.equal(key, "header:x-openclaw-session-key:agent:main:chat:123");
+});
+
+test("prefers body.user when no session header is provided", () => {
   const key = resolveSessionKey(
     makeRequest({ "x-session-id": "header-123" }, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "chat-123")
   );
-  assert.equal(key, "user:chat-123");
+  assert.equal(key, "header:x-session-id:header-123");
 });
 
 test("uses session header before IP fallback", () => {
@@ -47,6 +55,21 @@ test("uses session header before IP fallback", () => {
     makeBody([{ role: "user", content: "Hello" }])
   );
   assert.equal(key, "header:x-session-id:sess-abc");
+});
+
+test("scopes body.user by conversation fingerprint when headers are absent", () => {
+  const key = resolveSessionKey(
+    makeRequest({}, "10.0.0.1"),
+    makeBody([{ role: "user", content: "Hello" }], "chat-123")
+  );
+  assert.match(key, /^user:chat-123:fp:[a-f0-9]{16}$/);
+});
+
+test("different conversations under the same body.user get different keys", () => {
+  const req = makeRequest({}, "10.0.0.1");
+  const key1 = resolveSessionKey(req, makeBody([{ role: "user", content: "Conversation A" }], "agent-123"));
+  const key2 = resolveSessionKey(req, makeBody([{ role: "user", content: "Conversation B" }], "agent-123"));
+  assert.notEqual(key1, key2);
 });
 
 test("identity inspection reports fallback source details", () => {

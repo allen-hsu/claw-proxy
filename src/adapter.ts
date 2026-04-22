@@ -304,11 +304,57 @@ export interface ParsedToolCall {
   function: { name: string; arguments: string };
 }
 
+function normalizeParsedToolCall(parsed: any): ParsedToolCall | null {
+  const name =
+    typeof parsed?.name === "string"
+      ? parsed.name
+      : typeof parsed?.function?.name === "string"
+        ? parsed.function.name
+        : null;
+  if (!name) return null;
+
+  const rawArguments =
+    parsed?.arguments ??
+    parsed?.input ??
+    parsed?.function?.arguments ??
+    parsed?.function?.input ??
+    {};
+
+  return {
+    id: `call_${uuid().replace(/-/g, "").slice(0, 24)}`,
+    type: "function",
+    function: {
+      name,
+      arguments:
+        typeof rawArguments === "string"
+          ? rawArguments
+          : JSON.stringify(rawArguments ?? {}),
+    },
+  };
+}
+
+export function parseStructuredToolCalls(
+  content: Array<{ type?: string; [key: string]: unknown }> | undefined
+): ParsedToolCall[] {
+  if (!Array.isArray(content)) return [];
+
+  const toolCalls: ParsedToolCall[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type !== "tool_use") continue;
+    const toolCall = normalizeParsedToolCall(block);
+    if (toolCall) toolCalls.push(toolCall);
+  }
+  return toolCalls;
+}
+
 export function sanitizeAssistantText(text: string): string {
   return text
-    .replace(/```(?:xml|html|markdown)?\s*<tool_call>[\s\S]*?<\/tool_call>\s*```/gi, "")
+    .replace(/```(?:xml|html|markdown|json)?\s*<(tool_call|tool_use)>[\s\S]*?<\/\1>\s*```/gi, "")
     .replace(/<(thinking|analysis|reasoning|scratchpad)>[\s\S]*?<\/\1>/gi, "")
     .replace(/<(tool_result|previous_response)[\s\S]*?<\/(tool_result|previous_response)>/gi, "")
+    .replace(/<(tool_call|tool_use)>[\s\S]*?<\/\1>/gi, "")
+    .replace(/^\s*tool_use\s*:\s*.*$/gim, "")
     .replace(/^\s*(thinking|analysis|reasoning|scratchpad)\s*:\s*.*$/gim, "")
     .trim();
 }
@@ -317,31 +363,21 @@ export function parseToolCalls(text: string): {
   cleanText: string;
   toolCalls: ParsedToolCall[];
 } {
-  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  const regex = /<(tool_call|tool_use)>\s*([\s\S]*?)\s*<\/\1>/gi;
   const toolCalls: ParsedToolCall[] = [];
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(text)) !== null) {
     try {
-      const parsed = JSON.parse(match[1]);
-      toolCalls.push({
-        id: `call_${uuid().replace(/-/g, "").slice(0, 24)}`,
-        type: "function",
-        function: {
-          name: parsed.name,
-          arguments:
-            typeof parsed.arguments === "string"
-              ? parsed.arguments
-              : JSON.stringify(parsed.arguments ?? {}),
-        },
-      });
+      const parsed = JSON.parse(match[2]);
+      const toolCall = normalizeParsedToolCall(parsed);
+      if (toolCall) toolCalls.push(toolCall);
     } catch {
       // skip malformed tool calls
     }
   }
 
   const cleanText = sanitizeAssistantText(text)
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
     .trim();
 
   return { cleanText, toolCalls };

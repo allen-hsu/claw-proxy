@@ -19,7 +19,7 @@ export interface CliAssistantMessage {
   type: "assistant";
   message: {
     model: string;
-    content: Array<{ type: string; text?: string }>;
+    content: Array<{ type: string; text?: string; name?: string; input?: unknown; arguments?: unknown }>;
     stop_reason: string | null;
     usage: {
       input_tokens: number;

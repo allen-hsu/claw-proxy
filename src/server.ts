@@ -15,6 +15,7 @@ import {
   streamChunk,
   completionResponse,
   parseToolCalls,
+  parseStructuredToolCalls,
   snapshotMessages,
   isMessagePrefix,
 } from "./adapter.js";
@@ -416,6 +417,7 @@ async function handleStreamWithRetry(
   const proc = new ClaudeProcess();
   let done = false;
   let fullText = "";
+  let structuredToolCalls: ReturnType<typeof parseStructuredToolCalls> = [];
   let rateLimitResetsAt = 0;
   let sessionCollision = false;
 
@@ -444,6 +446,7 @@ async function handleStreamWithRetry(
 
   // Capture filtered text from assistant message (thinking blocks already removed in subprocess)
   proc.on("assistant", (msg: CliAssistantMessage) => {
+    structuredToolCalls = parseStructuredToolCalls(msg.message?.content as any);
     if (!fullText && Array.isArray(msg.message?.content)) {
       fullText = msg.message.content
         .filter((b) => b.type === "text" && b.text)
@@ -472,6 +475,8 @@ async function handleStreamWithRetry(
     const rateCooldownMs = rateLimitResetsAt
       ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
       : RATE_COOLDOWN_MS;
+    const responseText = fullText || resultText;
+    const rateLimited = isRateLimit(responseText);
 
     // Retryable errors
     if (result.is_error && attempt < MAX_RETRIES - 1) {
@@ -499,13 +504,41 @@ async function handleStreamWithRetry(
       }
     }
 
-    if (result.is_error) {
-      if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
-      else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
+    // Claude can sometimes surface usage-cap/rate-limit text without marking
+    // the final result as an error. Treat that as retryable too so the current
+    // request moves to the next account instead of returning the raw rejection.
+    if (rateLimited && attempt < MAX_RETRIES - 1) {
+      console.error(`[${requestId}] Rate limit text on ${account.account.name}, retrying...`);
+      sessions.invalidateSession(userId);
+      router.cooldown(account, rateCooldownMs);
+      cleanup();
+      handleStreamWithRetry(
+        res,
+        requestId,
+        model,
+        messages,
+        tools,
+        config,
+        router,
+        sessions,
+        attempt + 1,
+        userId,
+        allowResume,
+        identitySource
+      ).catch((err) => {
+        console.error(`[${requestId}] Retry failed: ${err.message}`);
+        if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+      });
+      return;
     }
 
-    const responseText = fullText || resultText;
-    const { cleanText, toolCalls } = parseToolCalls(responseText);
+    if (result.is_error) {
+      if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
+      else if (rateLimited) router.cooldown(account, rateCooldownMs);
+    }
+    const parsed = parseToolCalls(responseText);
+    const toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : structuredToolCalls;
+    const cleanText = parsed.cleanText;
 
     if (!result.is_error) {
       sessions.updateSession(
@@ -670,6 +703,7 @@ async function handleSyncWithRetry(
   const proc = new ClaudeProcess();
   let done = false;
   let fullText = "";
+  let structuredToolCalls: ReturnType<typeof parseStructuredToolCalls> = [];
   let rateLimitResetsAt = 0;
   let sessionCollision = false;
 
@@ -698,6 +732,7 @@ async function handleSyncWithRetry(
 
   // Capture filtered text from assistant message (thinking blocks already removed in subprocess)
   proc.on("assistant", (msg: CliAssistantMessage) => {
+    structuredToolCalls = parseStructuredToolCalls(msg.message?.content as any);
     if (!fullText && Array.isArray(msg.message?.content)) {
       fullText = msg.message.content
         .filter((b) => b.type === "text" && b.text)
@@ -726,6 +761,8 @@ async function handleSyncWithRetry(
     const rateCooldownMs = rateLimitResetsAt
       ? Math.max(rateLimitResetsAt * 1000 - Date.now(), RATE_COOLDOWN_MS)
       : RATE_COOLDOWN_MS;
+    const responseText = fullText || resultText;
+    const rateLimited = isRateLimit(responseText);
 
     if (result.is_error && attempt < MAX_RETRIES - 1) {
       if (isAuthError(resultText)) {
@@ -752,13 +789,39 @@ async function handleSyncWithRetry(
       }
     }
 
+    if (rateLimited && attempt < MAX_RETRIES - 1) {
+      console.error(`[${requestId}] Rate limit text on ${account.account.name}, retrying...`);
+      sessions.invalidateSession(userId);
+      router.cooldown(account, rateCooldownMs);
+      cleanup();
+      handleSyncWithRetry(
+        res,
+        requestId,
+        model,
+        messages,
+        tools,
+        config,
+        router,
+        sessions,
+        attempt + 1,
+        userId,
+        allowResume,
+        identitySource
+      ).catch((err) => {
+        console.error(`[${requestId}] Retry failed: ${err.message}`);
+        if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
+      });
+      return;
+    }
+
     if (result.is_error) {
       if (isAuthError(resultText)) router.cooldown(account, AUTH_COOLDOWN_MS);
-      else if (isRateLimit(resultText)) router.cooldown(account, rateCooldownMs);
+      else if (rateLimited) router.cooldown(account, rateCooldownMs);
     } else {
       // Prefer filtered text (thinking stripped) over result.result
       if (fullText) result.result = fullText;
-      const { toolCalls } = parseToolCalls(result.result ?? "");
+      const parsed = parseToolCalls(result.result ?? "");
+      const toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : structuredToolCalls;
       sessions.updateSession(
         userId,
         toolCalls.map((tc) => tc.id),

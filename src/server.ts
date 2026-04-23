@@ -128,6 +128,10 @@ function messagesTail(messages: OpenAIMessage[], count: number = 2): string {
     .join(" || ");
 }
 
+function isEmptySessionEntry(session: SessionEntry): boolean {
+  return session.lastMessageCount === 0 && session.messageSnapshot.length === 0;
+}
+
 function makeConversationFingerprint(messages: OpenAIMessage[]): { fingerprint: string; seedParts: string[] } {
   const seedParts: string[] = [];
 
@@ -420,7 +424,12 @@ async function handleStreamWithRetry(
   // 2. Now acquire account (after lock, so activeRequests is accurate)
   const maybeAccount = router.acquire(userId);
   if (!maybeAccount) {
+    const shouldInvalidateEmptySession = isEmptySessionEntry(handle.session);
     handle.release();
+    if (shouldInvalidateEmptySession) {
+      console.log(`[${requestId}] dropping_empty_session_on_unavailable key=${userId} session=${handle.session.sessionId.slice(0, 8)}`);
+      sessions.invalidateSession(userId);
+    }
     sendAccountUnavailableResponse(res, router, true);
     return;
   }
@@ -723,7 +732,12 @@ async function handleSyncWithRetry(
 
   const maybeAccount = router.acquire(userId);
   if (!maybeAccount) {
+    const shouldInvalidateEmptySession = isEmptySessionEntry(handle.session);
     handle.release();
+    if (shouldInvalidateEmptySession) {
+      console.log(`[${requestId}] dropping_empty_session_on_unavailable key=${userId} session=${handle.session.sessionId.slice(0, 8)}`);
+      sessions.invalidateSession(userId);
+    }
     sendAccountUnavailableResponse(res, router, false);
     return;
   }

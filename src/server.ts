@@ -52,6 +52,10 @@ export function isRateLimit(text: string): boolean {
   );
 }
 
+function maxAttemptsFor(router: AccountRouter): number {
+  return Math.max(MAX_RETRIES, router.status().length);
+}
+
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
 const SESSION_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
 const SESSION_HEADER_CANDIDATES = [
@@ -279,7 +283,15 @@ export function createServer(config: Config) {
   return app;
 }
 
-function sendAccountUnavailableResponse(
+export function beginSse(res: Response): void {
+  if (res.headersSent) return;
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+}
+
+export function sendAccountUnavailableResponse(
   res: Response,
   router: AccountRouter,
   stream: boolean
@@ -296,9 +308,12 @@ function sendAccountUnavailableResponse(
       retry_after_seconds: retryAfterSeconds,
     };
 
-    res.setHeader("Retry-After", String(retryAfterSeconds));
+    if (!res.headersSent) {
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+    }
 
-    if (stream && res.headersSent) {
+    if (stream) {
+      beginSse(res);
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
@@ -316,7 +331,8 @@ function sendAccountUnavailableResponse(
     },
   };
 
-  if (stream && res.headersSent) {
+  if (stream) {
+    beginSse(res);
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
     res.write("data: [DONE]\n\n");
     res.end();
@@ -342,6 +358,7 @@ async function handleStreamWithRetry(
   allowResume: boolean,
   identitySource: SessionIdentityInfo["source"]
 ): Promise<void> {
+  const maxAttempts = maxAttemptsFor(router);
   // 1. Acquire session lock first (may wait if session is busy)
   let handle = await sessions.acquireSession(userId);
 
@@ -403,14 +420,6 @@ async function handleStreamWithRetry(
     console.log(
       `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NEW session=${handle.session.sessionId.slice(0, 8)} | prompt_len=${prompt.length}`
     );
-  }
-
-  // Only set headers on first attempt
-  if (attempt === 0) {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders();
   }
 
   const abort = new AbortController();
@@ -479,26 +488,26 @@ async function handleStreamWithRetry(
     const rateLimited = isRateLimit(responseText);
 
     // Retryable errors
-    if (result.is_error && attempt < MAX_RETRIES - 1) {
+    if (result.is_error && attempt < maxAttempts - 1) {
       if (isAuthError(resultText)) {
-        console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
+        console.error(`[${requestId}] Auth error on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
-          if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+          if (!res.writableEnded) { beginSse(res); res.write("data: [DONE]\n\n"); res.end(); }
         });
         return;
       }
       if (isRateLimit(resultText)) {
-        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
-          if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+          if (!res.writableEnded) { beginSse(res); res.write("data: [DONE]\n\n"); res.end(); }
         });
         return;
       }
@@ -507,8 +516,8 @@ async function handleStreamWithRetry(
     // Claude can sometimes surface usage-cap/rate-limit text without marking
     // the final result as an error. Treat that as retryable too so the current
     // request moves to the next account instead of returning the raw rejection.
-    if (rateLimited && attempt < MAX_RETRIES - 1) {
-      console.error(`[${requestId}] Rate limit text on ${account.account.name}, retrying...`);
+    if (rateLimited && attempt < maxAttempts - 1) {
+      console.error(`[${requestId}] Rate limit text on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
       sessions.invalidateSession(userId);
       router.cooldown(account, rateCooldownMs);
       cleanup();
@@ -527,9 +536,13 @@ async function handleStreamWithRetry(
         identitySource
       ).catch((err) => {
         console.error(`[${requestId}] Retry failed: ${err.message}`);
-        if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+        if (!res.writableEnded) { beginSse(res); res.write("data: [DONE]\n\n"); res.end(); }
       });
       return;
+    }
+
+    if (rateLimited) {
+      console.error(`[${requestId}] Rate limit text on ${account.account.name}, no retries left (attempt=${attempt + 1}/${maxAttempts})`);
     }
 
     if (result.is_error) {
@@ -550,11 +563,13 @@ async function handleStreamWithRetry(
     }
 
     if (toolCalls.length > 0) {
+      beginSse(res);
       console.log(`[${requestId}] → tool_calls: [${toolCalls.map((tc) => tc.function.name).join(", ")}]`);
       if (cleanText) res.write(streamChunk(requestId, model, cleanText, null, true));
       res.write(streamChunk(requestId, model, null, null, !cleanText, toolCalls));
       res.write(streamChunk(requestId, model, null, "tool_calls"));
     } else {
+      beginSse(res);
       res.write(streamChunk(requestId, model, cleanText, null, true));
       res.write(streamChunk(requestId, model, null, "stop"));
     }
@@ -566,18 +581,20 @@ async function handleStreamWithRetry(
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
-    if (attempt < MAX_RETRIES - 1) {
+    if (attempt < maxAttempts - 1) {
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       cleanup();
       handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
         console.error(`[${requestId}] Retry failed: ${err.message}`);
-        if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+        if (!res.writableEnded) { beginSse(res); res.write("data: [DONE]\n\n"); res.end(); }
       });
       return;
     }
+    console.error(`[${requestId}] Error with no retries left (attempt=${attempt + 1}/${maxAttempts})`);
     cleanup();
     if (!res.writableEnded) {
+      beginSse(res);
       res.write(`data: ${JSON.stringify({ error: { message: "Internal error", type: "server_error" } })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
@@ -586,28 +603,30 @@ async function handleStreamWithRetry(
 
   proc.on("close", (code: number) => {
     if (!done) {
-      if (code !== 0 && attempt < MAX_RETRIES - 1) {
+      if (code !== 0 && attempt < maxAttempts - 1) {
         sessions.invalidateSession(userId);
         if (sessionCollision) {
           // Session collision is not an account health issue — retry without cooldown
-          console.error(`[${requestId}] Session collision on ${account.account.name}, retrying with fresh session...`);
+          console.error(`[${requestId}] Session collision on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts} with fresh session...`);
         } else {
-          console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+          console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
           router.cooldown(account, EXIT_COOLDOWN_MS);
         }
         cleanup();
         handleStreamWithRetry(res, requestId, model, messages, tools, config, router, sessions, attempt + 1, userId, allowResume, identitySource).catch((err) => {
           console.error(`[${requestId}] Retry failed: ${err.message}`);
-          if (!res.writableEnded) { res.write("data: [DONE]\n\n"); res.end(); }
+          if (!res.writableEnded) { beginSse(res); res.write("data: [DONE]\n\n"); res.end(); }
         });
         return;
       }
       if (code !== 0) {
+        console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, no retries left (attempt=${attempt + 1}/${maxAttempts})`);
         sessions.invalidateSession(userId);
         if (!sessionCollision) router.cooldown(account, EXIT_COOLDOWN_MS);
       }
       cleanup();
       if (!res.writableEnded) {
+        beginSse(res);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -641,6 +660,7 @@ async function handleSyncWithRetry(
   allowResume: boolean,
   identitySource: SessionIdentityInfo["source"]
 ): Promise<void> {
+  const maxAttempts = maxAttemptsFor(router);
   let handle = await sessions.acquireSession(userId);
 
   const maybeAccount = router.acquire(userId);
@@ -764,9 +784,9 @@ async function handleSyncWithRetry(
     const responseText = fullText || resultText;
     const rateLimited = isRateLimit(responseText);
 
-    if (result.is_error && attempt < MAX_RETRIES - 1) {
+    if (result.is_error && attempt < maxAttempts - 1) {
       if (isAuthError(resultText)) {
-        console.error(`[${requestId}] Auth error on ${account.account.name}, retrying...`);
+        console.error(`[${requestId}] Auth error on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, AUTH_COOLDOWN_MS);
         cleanup();
@@ -777,7 +797,7 @@ async function handleSyncWithRetry(
         return;
       }
       if (isRateLimit(resultText)) {
-        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying...`);
+        console.error(`[${requestId}] Rate limit on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
         sessions.invalidateSession(userId);
         router.cooldown(account, rateCooldownMs);
         cleanup();
@@ -789,8 +809,8 @@ async function handleSyncWithRetry(
       }
     }
 
-    if (rateLimited && attempt < MAX_RETRIES - 1) {
-      console.error(`[${requestId}] Rate limit text on ${account.account.name}, retrying...`);
+    if (rateLimited && attempt < maxAttempts - 1) {
+      console.error(`[${requestId}] Rate limit text on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
       sessions.invalidateSession(userId);
       router.cooldown(account, rateCooldownMs);
       cleanup();
@@ -812,6 +832,10 @@ async function handleSyncWithRetry(
         if (!res.headersSent) { res.status(500).json({ error: { message: "Retry failed", type: "server_error" } }); }
       });
       return;
+    }
+
+    if (rateLimited) {
+      console.error(`[${requestId}] Rate limit text on ${account.account.name}, no retries left (attempt=${attempt + 1}/${maxAttempts})`);
     }
 
     if (result.is_error) {
@@ -843,7 +867,7 @@ async function handleSyncWithRetry(
 
   proc.on("error", (err: Error) => {
     console.error(`[${requestId}] Error: ${err.message}`);
-    if (attempt < MAX_RETRIES - 1) {
+    if (attempt < maxAttempts - 1) {
       sessions.invalidateSession(userId);
       router.cooldown(account, EXIT_COOLDOWN_MS);
       cleanup();
@@ -853,6 +877,7 @@ async function handleSyncWithRetry(
       });
       return;
     }
+    console.error(`[${requestId}] Error with no retries left (attempt=${attempt + 1}/${maxAttempts})`);
     cleanup();
     if (!res.headersSent) {
       res.status(500).json({ error: { message: "Internal error", type: "server_error" } });
@@ -861,12 +886,12 @@ async function handleSyncWithRetry(
 
   proc.on("close", (code: number) => {
     if (!done) {
-      if (code !== 0 && attempt < MAX_RETRIES - 1) {
+      if (code !== 0 && attempt < maxAttempts - 1) {
         sessions.invalidateSession(userId);
         if (sessionCollision) {
-          console.error(`[${requestId}] Session collision on ${account.account.name}, retrying with fresh session...`);
+          console.error(`[${requestId}] Session collision on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts} with fresh session...`);
         } else {
-          console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying...`);
+          console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, retrying attempt=${attempt + 2}/${maxAttempts}...`);
           router.cooldown(account, EXIT_COOLDOWN_MS);
         }
         cleanup();
@@ -877,6 +902,7 @@ async function handleSyncWithRetry(
         return;
       }
       if (code !== 0) {
+        console.error(`[${requestId}] Process exited ${code} on ${account.account.name}, no retries left (attempt=${attempt + 1}/${maxAttempts})`);
         sessions.invalidateSession(userId);
         if (!sessionCollision) router.cooldown(account, EXIT_COOLDOWN_MS);
       }

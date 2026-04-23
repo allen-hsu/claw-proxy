@@ -11,7 +11,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch & node --watch dist/index.js",
-    "test": "tsc && node dist/session.test.js && node dist/router.test.js && node dist/server_identity.test.js && node dist/server_rate_limit.test.js && node dist/adapter_output.test.js && node dist/adapter_resume.test.js && node dist/server_resume.test.js",
+    "test": "tsc && node dist/session.test.js && node dist/router.test.js && node dist/server_identity.test.js && node dist/server_rate_limit.test.js && node dist/server_stream_retry.test.js && node dist/adapter_output.test.js && node dist/adapter_resume.test.js && node dist/server_resume.test.js",
     "setup": "node dist/index.js --setup"
   },
   "dependencies": {

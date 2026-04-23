@@ -62,12 +62,19 @@ export class SessionManager {
       };
       this.sessionsByUser.set(userId, session);
       isResume = false;
+      console.log(`[Sessions] acquire new key=${userId} session=${session.sessionId.slice(0, 8)} queue=0`);
     } else if (!session.busy) {
       // Session exists and is free — lock it
       session.busy = true;
       isResume = session.lastMessageCount > 0;
+      console.log(
+        `[Sessions] acquire existing key=${userId} session=${session.sessionId.slice(0, 8)} resume=${isResume ? "yes" : "no"} queue=${session.queue.length}`
+      );
     } else {
       // Session is busy — wait in queue
+      console.log(
+        `[Sessions] acquire queued key=${userId} session=${session.sessionId.slice(0, 8)} queue_before=${session.queue.length}`
+      );
       await new Promise<void>((resolve) => {
         session!.queue.push({ resolve });
       });
@@ -91,13 +98,20 @@ export class SessionManager {
           };
           this.sessionsByUser.set(userId, session);
           isResume = false;
+          console.log(`[Sessions] acquire recreated key=${userId} session=${session.sessionId.slice(0, 8)} after_invalidate`);
           break;
         } else if (!session.busy) {
           session.busy = true;
           isResume = session.lastMessageCount > 0;
+          console.log(
+            `[Sessions] acquire wake key=${userId} session=${session.sessionId.slice(0, 8)} resume=${isResume ? "yes" : "no"} queue=${session.queue.length}`
+          );
           break;
         } else {
           // Still busy — re-queue
+          console.log(
+            `[Sessions] acquire requeue key=${userId} session=${session.sessionId.slice(0, 8)} queue_before=${session.queue.length}`
+          );
           await new Promise<void>((resolve) => {
             session!.queue.push({ resolve });
           });
@@ -114,6 +128,9 @@ export class SessionManager {
       if (released) return;
       released = true;
       capturedSession.busy = false;
+      console.log(
+        `[Sessions] release key=${userId} session=${capturedSession.sessionId.slice(0, 8)} next_queue=${capturedSession.queue.length}`
+      );
       const next = capturedSession.queue.shift();
       if (next) {
         // Wake next waiter — it will set busy=true in the acquire loop
@@ -155,6 +172,9 @@ export class SessionManager {
     session.lastMessageCount = messageCount;
     session.messageSnapshot = [...messageSnapshot];
     session.lastUsedAt = Date.now();
+    console.log(
+      `[Sessions] update key=${userId} session=${session.sessionId.slice(0, 8)} messages=${messageCount} tool_calls=${toolCallIds.length} snapshot_len=${messageSnapshot.length}`
+    );
   }
 
   updateMetadata(
@@ -166,6 +186,9 @@ export class SessionManager {
     session.identitySource = metadata.identitySource;
     session.allowResume = metadata.allowResume;
     session.lastUsedAt = Date.now();
+    console.log(
+      `[Sessions] metadata key=${userId} session=${session.sessionId.slice(0, 8)} identity=${metadata.identitySource} allow_resume=${metadata.allowResume ? "on" : "off"} account=${session.accountName || "(unset)"}`
+    );
   }
 
   /** Invalidate and remove a session. Wakes queued waiters (they'll create new sessions). */
@@ -181,6 +204,9 @@ export class SessionManager {
     // Wake all queued waiters — they'll find no session in acquireSession and create new
     const waiters = session.queue.splice(0);
     this.sessionsByUser.delete(userId);
+    console.log(
+      `[Sessions] invalidate key=${userId} session=${session.sessionId.slice(0, 8)} waiters=${waiters.length} tool_calls=${session.toolCallIds.size}`
+    );
     for (const waiter of waiters) {
       waiter.resolve();
     }

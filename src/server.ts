@@ -72,8 +72,21 @@ export interface SessionIdentityInfo {
   detail: string;
 }
 
+function isTrustedLocalFallback(identity: SessionIdentityInfo): boolean {
+  if (identity.source !== "fallback") return false;
+  return (
+    identity.key.startsWith("ip:127.0.0.1:") ||
+    identity.key.startsWith("ip:::1:") ||
+    identity.key.startsWith("ip:::ffff:127.0.0.1:")
+  );
+}
+
 export function identityAllowsResume(identity: SessionIdentityInfo): boolean {
-  return identity.source === "header" || identity.source === "user";
+  return (
+    identity.source === "header" ||
+    identity.source === "user" ||
+    isTrustedLocalFallback(identity)
+  );
 }
 
 export type ResumeDecisionReason =
@@ -93,7 +106,29 @@ function firstTextBlock(msg: OpenAIMessage): string {
     .join("\n");
 }
 
-function makeConversationFingerprint(messages: OpenAIMessage[]): string {
+function shortText(text: string, maxLen: number = 120): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLen) return normalized;
+  return `${normalized.slice(0, maxLen)}...`;
+}
+
+function snapshotTail(snapshot: SessionEntry["messageSnapshot"], count: number = 2): string {
+  if (snapshot.length === 0) return "(empty)";
+  return snapshot
+    .slice(-count)
+    .map((line) => shortText(line, 140))
+    .join(" || ");
+}
+
+function messagesTail(messages: OpenAIMessage[], count: number = 2): string {
+  if (messages.length === 0) return "(empty)";
+  return messages
+    .slice(-count)
+    .map((msg) => `${msg.role}:${shortText(firstTextBlock(msg), 140)}`)
+    .join(" || ");
+}
+
+function makeConversationFingerprint(messages: OpenAIMessage[]): { fingerprint: string; seedParts: string[] } {
   const seedParts: string[] = [];
 
   for (const msg of messages) {
@@ -105,12 +140,23 @@ function makeConversationFingerprint(messages: OpenAIMessage[]): string {
   }
 
   const seed = seedParts.join("\n---\n");
-  if (!seed) return "anonymous";
+  if (!seed) return { fingerprint: "anonymous", seedParts };
 
-  return createHash("sha1").update(seed).digest("hex").slice(0, 16);
+  return {
+    fingerprint: createHash("sha1").update(seed).digest("hex").slice(0, 16),
+    seedParts,
+  };
 }
 
 export function inspectSessionIdentity(req: Request, body: OpenAIRequest): SessionIdentityInfo {
+  const incomingHeaders = Object.fromEntries(
+    SESSION_HEADER_CANDIDATES.map((header) => [header, req.header(header)?.trim() || ""])
+  );
+  const explicitUser = typeof body.user === "string" ? body.user.trim() : "";
+  console.log(
+    `[Identity] ip=${req.ip || "unknown"} | user=${explicitUser || "(empty)"} | headers=${JSON.stringify(incomingHeaders)}`
+  );
+
   // Prefer explicit conversation-scoped headers before body.user so OpenClaw
   // sessions do not collapse when a client reuses one user value across chats.
   for (const header of SESSION_HEADER_CANDIDATES) {
@@ -124,9 +170,12 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
     }
   }
 
-  const explicitUser = typeof body.user === "string" ? body.user.trim() : "";
+  const { fingerprint, seedParts } = makeConversationFingerprint(body.messages ?? []);
+  console.log(
+    `[Fingerprint] messages=${body.messages?.length ?? 0} | seed_parts=${seedParts.length} | seed=${JSON.stringify(seedParts.map((part) => shortText(part, 180)))} | fingerprint=${fingerprint}`
+  );
+
   if (explicitUser) {
-    const fingerprint = makeConversationFingerprint(body.messages ?? []);
     return {
       key: `user:${explicitUser}:fp:${fingerprint}`,
       source: "user",
@@ -135,7 +184,6 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
   }
 
   const ip = req.ip || "unknown";
-  const fingerprint = makeConversationFingerprint(body.messages ?? []);
   return {
     key: `ip:${ip}:fp:${fingerprint}`,
     source: "fallback",
@@ -240,6 +288,13 @@ export function createServer(config: Config) {
 
     console.log(
       `[${requestId}] ${body.stream ? "stream" : "sync"} | model=${model} | sessionKey=${userId} | identity=${identity.source}:${identity.detail} | resume=${allowResume ? "on" : "off"} | messages=${body.messages.length}`
+    );
+    console.log(
+      `[${requestId}] identity_debug | ip=${req.ip || "unknown"} | body.user=${typeof body.user === "string" && body.user.trim() ? body.user.trim() : "(empty)"} | headers=${JSON.stringify(
+        Object.fromEntries(
+          SESSION_HEADER_CANDIDATES.map((header) => [header, req.header(header)?.trim() || ""])
+        )
+      )}`
     );
 
     if (body.stream) {
@@ -387,6 +442,9 @@ async function handleStreamWithRetry(
     messages,
     accountChanged,
     allowResume && handle.isResume
+  );
+  console.log(
+    `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
   );
   const resumePrompt = resumeDecision === "resumed"
     ? buildResumePrompt(messages, handle.session.messageSnapshot)
@@ -684,6 +742,9 @@ async function handleSyncWithRetry(
     messages,
     accountChanged,
     allowResume && handle.isResume
+  );
+  console.log(
+    `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
   );
   const resumePrompt = resumeDecision === "resumed"
     ? buildResumePrompt(messages, handle.session.messageSnapshot)

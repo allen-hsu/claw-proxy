@@ -105,6 +105,22 @@ test("resume stays disabled for fallback identities", () => {
   assert.equal(identityAllowsResume(identity), false);
 });
 
+test("resume is allowed for localhost fallback identities", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([{ role: "user", content: "Hello" }])
+  );
+  assert.equal(identityAllowsResume(identity), true);
+});
+
+test("resume is allowed for ipv6 localhost fallback identities", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "::1"),
+    makeBody([{ role: "user", content: "Hello" }])
+  );
+  assert.equal(identityAllowsResume(identity), true);
+});
+
 test("same conversation on same IP gets stable fallback key", () => {
   const req = makeRequest({}, "10.0.0.1");
   const body = makeBody([

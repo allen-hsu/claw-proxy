@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { Request } from "express";
-import { inspectSessionIdentity, resolveSessionKey } from "./server.js";
+import { identityAllowsResume, inspectSessionIdentity, resolveSessionKey } from "./server.js";
 import type { OpenAIRequest } from "./adapter.js";
 
 function makeRequest(headers: Record<string, string | undefined>, ip = "127.0.0.1"): Request {
@@ -79,6 +79,30 @@ test("identity inspection reports fallback source details", () => {
   );
   assert.equal(identity.source, "fallback");
   assert.match(identity.detail, /ip=10\.0\.0\.9 fingerprint=/);
+});
+
+test("resume is allowed for explicit session headers", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({ "x-openclaw-session-key": "agent:main:chat:123" }, "10.0.0.1"),
+    makeBody([{ role: "user", content: "Hello" }], "agent-123")
+  );
+  assert.equal(identityAllowsResume(identity), true);
+});
+
+test("resume is allowed for body.user identities", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "10.0.0.1"),
+    makeBody([{ role: "user", content: "Hello" }], "agent-123")
+  );
+  assert.equal(identityAllowsResume(identity), true);
+});
+
+test("resume stays disabled for fallback identities", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "10.0.0.1"),
+    makeBody([{ role: "user", content: "Hello" }])
+  );
+  assert.equal(identityAllowsResume(identity), false);
 });
 
 test("same conversation on same IP gets stable fallback key", () => {

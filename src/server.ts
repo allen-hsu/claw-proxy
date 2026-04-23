@@ -72,8 +72,8 @@ export interface SessionIdentityInfo {
   detail: string;
 }
 
-function identityAllowsResume(identity: SessionIdentityInfo): boolean {
-  return identity.source === "header";
+export function identityAllowsResume(identity: SessionIdentityInfo): boolean {
+  return identity.source === "header" || identity.source === "user";
 }
 
 export type ResumeDecisionReason =

@@ -108,6 +108,36 @@ test("uses unknown agent when metadata exists but name is missing", () => {
   assert.equal(key, "meta:dm:allen::agent:unknown");
 });
 
+test("infers DM metadata key from sender_id when conversation_label is missing", () => {
+  const key = resolveSessionKey(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([
+      { role: "system", content: "**Name:** Jarvis" },
+      {
+        role: "user",
+        content:
+          'System: [2026-04-24 12:42:45 GMT+8] Slack DM from Allen: Hi\n\nConversation info (untrusted metadata):\n```json\n{"message_id":"1777005764.218169","sender_id":"U095FJVSGBV"}\n```',
+      },
+    ])
+  );
+  assert.equal(key, "meta:dm:U095FJVSGBV::agent:Jarvis");
+});
+
+test("does not infer DM key from sender_id for non-DM conversations", () => {
+  const key = resolveSessionKey(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([
+      { role: "system", content: "**Name:** Jarvis" },
+      {
+        role: "user",
+        content:
+          'System: [2026-04-24 12:42:45 GMT+8] Slack message in #agent-playground from Allen: Hi\n\nConversation info (untrusted metadata):\n```json\n{"message_id":"1777005764.218169","sender_id":"U095FJVSGBV"}\n```',
+      },
+    ])
+  );
+  assert.match(key, /^ip:127\.0\.0\.1:fp:[a-f0-9]{16}$/);
+});
+
 test("metadata key stays stable even when later assistant content changes", () => {
   const req = makeRequest({}, "127.0.0.1");
   const base = [
@@ -217,6 +247,24 @@ test("same conversation on same IP gets stable fallback key", () => {
 
   const key1 = resolveSessionKey(req, body);
   const key2 = resolveSessionKey(req, body);
+  assert.equal(key1, key2);
+});
+
+test("fallback key stays stable when later turns append assistant and user messages", () => {
+  const req = makeRequest({}, "127.0.0.1");
+  const firstTurn = makeBody([
+    { role: "system", content: "You are helpful." },
+    { role: "user", content: "Hi" },
+  ]);
+  const laterTurn = makeBody([
+    { role: "system", content: "You are helpful." },
+    { role: "user", content: "Hi" },
+    { role: "assistant", content: "Hello there." },
+    { role: "user", content: "Who are you?" },
+  ]);
+
+  const key1 = resolveSessionKey(req, firstTurn);
+  const key2 = resolveSessionKey(req, laterTurn);
   assert.equal(key1, key2);
 });
 

@@ -115,8 +115,21 @@ test("metadata primary key requests rebuild when transcript shrinks", () => {
     messageSnapshot: ['{"content":"Hello","role":"user"}'],
   });
   const messages: OpenAIMessage[] = [
+    { role: "system", content: "You are helpful." },
     { role: "user", content: "Hello" },
-    { role: "assistant", content: "Hi" },
+  ];
+  const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
+  assert.equal(result.mode, "refresh");
+  assert.equal(result.prompt, "User: Hello");
+});
+
+test("metadata primary key rebuilds when shrunk transcript has no resumable body", () => {
+  const session = makeSession({
+    lastMessageCount: 4,
+    messageSnapshot: ['{"content":"Hello","role":"user"}'],
+  });
+  const messages: OpenAIMessage[] = [
+    { role: "system", content: "You are helpful." },
   ];
   const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
   assert.equal(result.mode, "rebuild");

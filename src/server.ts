@@ -94,7 +94,7 @@ export type ResumeDecisionReason =
   | "prefix_mismatch"
   | "no_growth";
 
-export type PrimaryKeyResumeMode = "resume" | "noop" | "rebuild" | "skip";
+export type PrimaryKeyResumeMode = "resume" | "refresh" | "noop" | "rebuild" | "skip";
 
 function firstTextBlock(msg: OpenAIMessage): string {
   if (typeof msg.content === "string") return msg.content;
@@ -129,6 +129,18 @@ function messagesTail(messages: OpenAIMessage[], count: number = 2): string {
 
 function isEmptySessionEntry(session: SessionEntry): boolean {
   return session.lastMessageCount === 0 && session.messageSnapshot.length === 0;
+}
+
+function countLeadingSetupMessages(messages: OpenAIMessage[]): number {
+  let count = 0;
+  for (const message of messages) {
+    if (message.role === "system" || message.role === "developer") {
+      count++;
+      continue;
+    }
+    break;
+  }
+  return count;
 }
 
 function extractConversationMetadata(messages: OpenAIMessage[]): {
@@ -170,6 +182,17 @@ function extractConversationMetadata(messages: OpenAIMessage[]): {
   return {};
 }
 
+function isSlackDmConversation(messages: OpenAIMessage[]): boolean {
+  for (const msg of messages) {
+    if (msg.role !== "user") continue;
+    const text = firstTextBlock(msg);
+    if (/\bSlack DM from\b/i.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function extractAgentName(messages: OpenAIMessage[]): string | undefined {
   const namePatterns = [
     /\*\*Name:\*\*\s*([^\n]+)/i,
@@ -194,7 +217,10 @@ function makeConversationFingerprint(messages: OpenAIMessage[]): { fingerprint: 
   const seedParts: string[] = [];
 
   for (const msg of messages) {
-    if (msg.role === "tool") continue;
+    // Keep fallback identity stable across turns. Once the transcript contains
+    // assistant/tool output, later requests for the same conversation should
+    // still hash from the original conversation seed instead of drifting.
+    if (msg.role === "assistant" || msg.role === "tool") break;
     const text = firstTextBlock(msg).trim();
     if (!text) continue;
     seedParts.push(`${msg.role}:${text.slice(0, 500)}`);
@@ -238,6 +264,19 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
       key: `meta:${metadata.conversationLabel}::agent:${resolvedAgent}`,
       source: "metadata",
       detail: `conversation_label=${metadata.conversationLabel} agent=${resolvedAgent}`,
+    };
+    console.log(
+      `[IdentitySelected] source=${identity.source} | key=${identity.key} | detail=${identity.detail}`
+    );
+    return identity;
+  }
+
+  if (metadata.senderId && isSlackDmConversation(body.messages ?? [])) {
+    const resolvedAgent = agentName || "unknown";
+    const identity: SessionIdentityInfo = {
+      key: `meta:dm:${metadata.senderId}::agent:${resolvedAgent}`,
+      source: "metadata",
+      detail: `conversation_label=dm:${metadata.senderId} agent=${resolvedAgent} inferred=slack_dm`,
     };
     console.log(
       `[IdentitySelected] source=${identity.source} | key=${identity.key} | detail=${identity.detail}`
@@ -292,7 +331,8 @@ export function getPrimaryKeyResumeMode(
   if (messages.length === session.lastMessageCount) {
     return { mode: "noop", prompt: null };
   }
-  return { mode: "rebuild", prompt: null };
+  const prompt = extractNewMessages(messages, countLeadingSetupMessages(messages));
+  return { mode: prompt ? "refresh" : "rebuild", prompt: prompt || null };
 }
 
 export function createServer(config: Config) {
@@ -549,7 +589,7 @@ async function handleStreamWithRetry(
   console.log(
     `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | primary_mode=${primaryKeyResume.mode} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
   );
-  const resumePrompt = primaryKeyResume.mode === "resume"
+  const resumePrompt = (primaryKeyResume.mode === "resume" || primaryKeyResume.mode === "refresh")
     ? primaryKeyResume.prompt
     : resumeDecision === "resumed"
       ? buildResumePrompt(messages, handle.session.messageSnapshot)
@@ -573,7 +613,7 @@ async function handleStreamWithRetry(
     spawnResumeId = handle.session.sessionId;
     prompt = resumePrompt;
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | ${primaryKeyResume.mode === "refresh" ? "REFRESH" : "RESUME"} session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
     );
   } else {
     if (handle.isResume) {
@@ -877,7 +917,7 @@ async function handleSyncWithRetry(
   console.log(
     `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | primary_mode=${primaryKeyResume.mode} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
   );
-  const resumePrompt = primaryKeyResume.mode === "resume"
+  const resumePrompt = (primaryKeyResume.mode === "resume" || primaryKeyResume.mode === "refresh")
     ? primaryKeyResume.prompt
     : resumeDecision === "resumed"
       ? buildResumePrompt(messages, handle.session.messageSnapshot)
@@ -910,7 +950,7 @@ async function handleSyncWithRetry(
     spawnResumeId = handle.session.sessionId;
     prompt = resumePrompt;
     console.log(
-      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | RESUME session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
+      `[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | ${primaryKeyResume.mode === "refresh" ? "REFRESH" : "RESUME"} session=${handle.session.sessionId.slice(0, 8)} | delta_len=${prompt.length}`
     );
   } else {
     if (handle.isResume) {

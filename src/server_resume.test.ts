@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { getResumeDecision } from "./server.js";
+import { getPrimaryKeyResumeMode, getResumeDecision } from "./server.js";
 import type { SessionEntry } from "./session.js";
 import type { OpenAIMessage } from "./adapter.js";
 
@@ -79,6 +79,47 @@ test("returns resumed for append-only transcript growth", () => {
     messageSnapshot: ['{"content":"Hello","role":"user"}'],
   });
   assert.equal(getResumeDecision(session, messages, false, true), "resumed");
+});
+
+test("metadata primary key resumes by message count growth", () => {
+  const session = makeSession({
+    lastMessageCount: 2,
+    messageSnapshot: ['{"content":"Hello","role":"user"}'],
+  });
+  const messages: OpenAIMessage[] = [
+    { role: "user", content: "Hello" },
+    { role: "assistant", content: "Hi" },
+    { role: "user", content: "Continue" },
+  ];
+  const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
+  assert.equal(result.mode, "resume");
+  assert.equal(result.prompt, "User: Continue");
+});
+
+test("metadata primary key returns noop when message count is unchanged", () => {
+  const session = makeSession({
+    lastMessageCount: 2,
+    messageSnapshot: ['{"content":"Hello","role":"user"}'],
+  });
+  const messages: OpenAIMessage[] = [
+    { role: "user", content: "Hello" },
+    { role: "assistant", content: "Hi" },
+  ];
+  const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
+  assert.equal(result.mode, "noop");
+});
+
+test("metadata primary key requests rebuild when transcript shrinks", () => {
+  const session = makeSession({
+    lastMessageCount: 4,
+    messageSnapshot: ['{"content":"Hello","role":"user"}'],
+  });
+  const messages: OpenAIMessage[] = [
+    { role: "user", content: "Hello" },
+    { role: "assistant", content: "Hi" },
+  ];
+  const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
+  assert.equal(result.mode, "rebuild");
 });
 
 console.log("");

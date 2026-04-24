@@ -11,6 +11,7 @@ import {
   resolveModel,
   messagesToPrompt,
   buildResumePrompt,
+  extractNewMessages,
   makeRequestId,
   streamChunk,
   completionResponse,
@@ -92,6 +93,8 @@ export type ResumeDecisionReason =
   | "empty_snapshot"
   | "prefix_mismatch"
   | "no_growth";
+
+export type PrimaryKeyResumeMode = "resume" | "noop" | "rebuild" | "skip";
 
 function firstTextBlock(msg: OpenAIMessage): string {
   if (typeof msg.content === "string") return msg.content;
@@ -270,6 +273,26 @@ export function getResumeDecision(
   if (!isMessagePrefix(session.messageSnapshot, messages)) return "prefix_mismatch";
   if (session.messageSnapshot.length >= messages.length) return "no_growth";
   return "resumed";
+}
+
+export function getPrimaryKeyResumeMode(
+  session: SessionEntry,
+  messages: OpenAIMessage[],
+  identitySource: SessionIdentityInfo["source"],
+  accountChanged: boolean,
+  isResume: boolean
+): { mode: PrimaryKeyResumeMode; prompt: string | null } {
+  if (identitySource !== "metadata" || !isResume || accountChanged || session.lastMessageCount === 0) {
+    return { mode: "skip", prompt: null };
+  }
+  if (messages.length > session.lastMessageCount) {
+    const prompt = extractNewMessages(messages, session.lastMessageCount);
+    return { mode: prompt ? "resume" : "skip", prompt: prompt || null };
+  }
+  if (messages.length === session.lastMessageCount) {
+    return { mode: "noop", prompt: null };
+  }
+  return { mode: "rebuild", prompt: null };
 }
 
 export function createServer(config: Config) {
@@ -510,6 +533,13 @@ async function handleStreamWithRetry(
   sessions.updateMetadata(userId, { identitySource, allowResume });
 
   // Decide resume vs new
+  const primaryKeyResume = getPrimaryKeyResumeMode(
+    handle.session,
+    messages,
+    identitySource,
+    accountChanged,
+    allowResume && handle.isResume
+  );
   const resumeDecision = getResumeDecision(
     handle.session,
     messages,
@@ -517,15 +547,27 @@ async function handleStreamWithRetry(
     allowResume && handle.isResume
   );
   console.log(
-    `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
+    `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | primary_mode=${primaryKeyResume.mode} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
   );
-  const resumePrompt = resumeDecision === "resumed"
-    ? buildResumePrompt(messages, handle.session.messageSnapshot)
-    : null;
+  const resumePrompt = primaryKeyResume.mode === "resume"
+    ? primaryKeyResume.prompt
+    : resumeDecision === "resumed"
+      ? buildResumePrompt(messages, handle.session.messageSnapshot)
+      : null;
   const canResume = resumePrompt !== null;
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
+
+  if (primaryKeyResume.mode === "noop") {
+    console.log(`[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NOOP same_primary_key`);
+    cleanup();
+    beginSse(res);
+    res.write(streamChunk(requestId, model, "", "stop", true));
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
 
   if (canResume) {
     spawnResumeId = handle.session.sessionId;
@@ -540,7 +582,10 @@ async function handleStreamWithRetry(
       );
     }
     // Session was used before but can't resume — create fresh session ID
-    if (handle.session.lastMessageCount > 0) {
+    if (
+      (identitySource === "metadata" && primaryKeyResume.mode === "rebuild" && handle.session.lastMessageCount > 0) ||
+      (identitySource !== "metadata" && handle.session.lastMessageCount > 0)
+    ) {
       sessions.invalidateSession(userId);
       handle = await sessions.acquireSession(userId);
       handle.session.accountName = account.account.name;
@@ -822,16 +867,44 @@ async function handleSyncWithRetry(
     accountChanged,
     allowResume && handle.isResume
   );
-  console.log(
-    `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
+  const primaryKeyResume = getPrimaryKeyResumeMode(
+    handle.session,
+    messages,
+    identitySource,
+    accountChanged,
+    allowResume && handle.isResume
   );
-  const resumePrompt = resumeDecision === "resumed"
-    ? buildResumePrompt(messages, handle.session.messageSnapshot)
-    : null;
+  console.log(
+    `[${requestId}] resume_check | is_resume_candidate=${allowResume && handle.isResume ? "yes" : "no"} | account_changed=${accountChanged} | prev_snapshot_len=${handle.session.messageSnapshot.length} | incoming_messages_len=${messages.length} | prefix_match=${isMessagePrefix(handle.session.messageSnapshot, messages)} | primary_mode=${primaryKeyResume.mode} | snapshot_tail=${snapshotTail(handle.session.messageSnapshot)} | incoming_tail=${messagesTail(messages)}`
+  );
+  const resumePrompt = primaryKeyResume.mode === "resume"
+    ? primaryKeyResume.prompt
+    : resumeDecision === "resumed"
+      ? buildResumePrompt(messages, handle.session.messageSnapshot)
+      : null;
   const canResume = resumePrompt !== null;
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
+
+  if (primaryKeyResume.mode === "noop") {
+    console.log(`[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NOOP same_primary_key`);
+    cleanup();
+    if (!res.headersSent) {
+      res.json(
+        completionResponse(requestId, model, {
+          type: "result",
+          subtype: "noop",
+          is_error: false,
+          result: "",
+          duration_ms: 0,
+          total_cost_usd: 0,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        })
+      );
+    }
+    return;
+  }
 
   if (canResume) {
     spawnResumeId = handle.session.sessionId;
@@ -846,7 +919,10 @@ async function handleSyncWithRetry(
       );
     }
     // Session was used before but can't resume — create fresh session ID
-    if (handle.session.lastMessageCount > 0) {
+    if (
+      (identitySource === "metadata" && primaryKeyResume.mode === "rebuild" && handle.session.lastMessageCount > 0) ||
+      (identitySource !== "metadata" && handle.session.lastMessageCount > 0)
+    ) {
       sessions.invalidateSession(userId);
       handle = await sessions.acquireSession(userId);
       handle.session.accountName = account.account.name;

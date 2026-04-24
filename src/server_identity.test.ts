@@ -33,39 +33,46 @@ function test(name: string, fn: () => void) {
 
 console.log("Session key tests\n");
 
-test("prefers openclaw session header over body.user when provided", () => {
+test("falls back when only header is provided", () => {
   const key = resolveSessionKey(
     makeRequest({ "x-openclaw-session-key": "agent:main:chat:123" }, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "agent-123")
   );
-  assert.equal(key, "header:x-openclaw-session-key:agent:main:chat:123");
+  assert.match(key, /^ip:10\.0\.0\.1:fp:[a-f0-9]{16}$/);
 });
 
-test("prefers body.user when no session header is provided", () => {
+test("falls back when only body.user is provided", () => {
   const key = resolveSessionKey(
     makeRequest({ "x-session-id": "header-123" }, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "chat-123")
   );
-  assert.equal(key, "header:x-session-id:header-123");
+  assert.match(key, /^ip:10\.0\.0\.1:fp:[a-f0-9]{16}$/);
 });
 
-test("uses session header before IP fallback", () => {
+test("uses metadata key when conversation metadata is present", () => {
   const key = resolveSessionKey(
-    makeRequest({ "x-session-id": "sess-abc" }, "10.0.0.1"),
-    makeBody([{ role: "user", content: "Hello" }])
+    makeRequest({ "x-session-id": "sess-abc" }, "127.0.0.1"),
+    makeBody([
+      { role: "system", content: "**Name:** helper-bot" },
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"conversation_label":"dm:allen","sender_id":"123"}\n```',
+      },
+    ])
   );
-  assert.equal(key, "header:x-session-id:sess-abc");
+  assert.equal(key, "meta:dm:allen::agent:helper-bot");
 });
 
-test("scopes body.user by conversation fingerprint when headers are absent", () => {
+test("falls back even when body.user is present if metadata is absent", () => {
   const key = resolveSessionKey(
     makeRequest({}, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "chat-123")
   );
-  assert.match(key, /^user:chat-123:fp:[a-f0-9]{16}$/);
+  assert.match(key, /^ip:10\.0\.0\.1:fp:[a-f0-9]{16}$/);
 });
 
-test("different conversations under the same body.user get different keys", () => {
+test("different fallback conversations still get different keys", () => {
   const req = makeRequest({}, "10.0.0.1");
   const key1 = resolveSessionKey(req, makeBody([{ role: "user", content: "Conversation A" }], "agent-123"));
   const key2 = resolveSessionKey(req, makeBody([{ role: "user", content: "Conversation B" }], "agent-123"));
@@ -85,6 +92,20 @@ test("prefers conversation metadata over body.user when present", () => {
     ], "agent-123")
   );
   assert.equal(key, "meta:dm:allen::agent:helper-bot");
+});
+
+test("uses unknown agent when metadata exists but name is missing", () => {
+  const key = resolveSessionKey(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"conversation_label":"dm:allen","sender_id":"123"}\n```',
+      },
+    ])
+  );
+  assert.equal(key, "meta:dm:allen::agent:unknown");
 });
 
 test("metadata key stays stable even when later assistant content changes", () => {
@@ -131,20 +152,20 @@ test("identity inspection reports metadata source details", () => {
   assert.match(identity.detail, /conversation_label=dm:allen/);
 });
 
-test("resume is allowed for explicit session headers", () => {
+test("resume is disabled for explicit session headers without metadata", () => {
   const identity = inspectSessionIdentity(
     makeRequest({ "x-openclaw-session-key": "agent:main:chat:123" }, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "agent-123")
   );
-  assert.equal(identityAllowsResume(identity), true);
+  assert.equal(identityAllowsResume(identity), false);
 });
 
-test("resume is allowed for body.user identities", () => {
+test("resume is disabled for body.user identities without metadata", () => {
   const identity = inspectSessionIdentity(
     makeRequest({}, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "agent-123")
   );
-  assert.equal(identityAllowsResume(identity), true);
+  assert.equal(identityAllowsResume(identity), false);
 });
 
 test("resume is allowed for metadata identities", () => {

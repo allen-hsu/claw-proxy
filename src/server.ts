@@ -82,12 +82,7 @@ function isTrustedLocalFallback(identity: SessionIdentityInfo): boolean {
 }
 
 export function identityAllowsResume(identity: SessionIdentityInfo): boolean {
-  return (
-    identity.source === "header" ||
-    identity.source === "metadata" ||
-    identity.source === "user" ||
-    isTrustedLocalFallback(identity)
-  );
+  return identity.source === "metadata" || isTrustedLocalFallback(identity);
 }
 
 export type ResumeDecisionReason =
@@ -221,19 +216,6 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
     `[Identity] ip=${req.ip || "unknown"} | user=${explicitUser || "(empty)"} | headers=${JSON.stringify(incomingHeaders)}`
   );
 
-  // Prefer explicit conversation-scoped headers before body.user so OpenClaw
-  // sessions do not collapse when a client reuses one user value across chats.
-  for (const header of SESSION_HEADER_CANDIDATES) {
-    const value = req.header(header)?.trim();
-    if (value) {
-      return {
-        key: `header:${header}:${value}`,
-        source: "header",
-        detail: `${header}=${value}`,
-      };
-    }
-  }
-
   const { fingerprint, seedParts } = makeConversationFingerprint(body.messages ?? []);
   console.log(
     `[Fingerprint] messages=${body.messages?.length ?? 0} | seed_parts=${seedParts.length} | seed=${JSON.stringify(seedParts.map((part) => shortText(part, 180)))} | fingerprint=${fingerprint}`
@@ -248,28 +230,28 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
   }
 
   if (metadata.conversationLabel) {
-    const agentPart = agentName ? `::agent:${agentName}` : "";
-    return {
-      key: `meta:${metadata.conversationLabel}${agentPart}`,
+    const resolvedAgent = agentName || "unknown";
+    const identity: SessionIdentityInfo = {
+      key: `meta:${metadata.conversationLabel}::agent:${resolvedAgent}`,
       source: "metadata",
-      detail: `conversation_label=${metadata.conversationLabel}${agentName ? ` agent=${agentName}` : ""}`,
+      detail: `conversation_label=${metadata.conversationLabel} agent=${resolvedAgent}`,
     };
-  }
-
-  if (explicitUser) {
-    return {
-      key: `user:${explicitUser}:fp:${fingerprint}`,
-      source: "user",
-      detail: `${explicitUser} fingerprint=${fingerprint}`,
-    };
+    console.log(
+      `[IdentitySelected] source=${identity.source} | key=${identity.key} | detail=${identity.detail}`
+    );
+    return identity;
   }
 
   const ip = req.ip || "unknown";
-  return {
+  const identity: SessionIdentityInfo = {
     key: `ip:${ip}:fp:${fingerprint}`,
     source: "fallback",
     detail: `ip=${ip} fingerprint=${fingerprint}`,
   };
+  console.log(
+    `[IdentitySelected] source=${identity.source} | key=${identity.key} | detail=${identity.detail}`
+  );
+  return identity;
 }
 
 export function resolveSessionKey(req: Request, body: OpenAIRequest): string {
@@ -353,8 +335,12 @@ export function createServer(config: Config) {
   // Chat completions
   app.post("/v1/chat/completions", async (req: Request, res: Response) => {
     const body = req.body as OpenAIRequest;
+    console.log(
+      `[RequestIn] method=${req.method} | path=${req.path} | ip=${req.ip || "unknown"} | stream=${Boolean(body?.stream)} | model=${typeof body?.model === "string" ? body.model : "(missing)"} | messages=${Array.isArray(body?.messages) ? body.messages.length : 0} | tools=${Array.isArray(body?.tools) ? body.tools.length : 0}`
+    );
 
     if (!body.messages?.length) {
+      console.log("[RequestReject] reason=missing_messages");
       res.status(400).json({
         error: { message: "messages is required and must be non-empty", type: "invalid_request" },
       });
@@ -507,6 +493,7 @@ async function handleStreamWithRetry(
       console.log(`[${requestId}] dropping_empty_session_on_unavailable key=${userId} session=${handle.session.sessionId.slice(0, 8)}`);
       sessions.invalidateSession(userId);
     }
+    console.log(`[${requestId}] account_unavailable stream=yes key=${userId}`);
     sendAccountUnavailableResponse(res, router, true);
     return;
   }
@@ -815,6 +802,7 @@ async function handleSyncWithRetry(
       console.log(`[${requestId}] dropping_empty_session_on_unavailable key=${userId} session=${handle.session.sessionId.slice(0, 8)}`);
       sessions.invalidateSession(userId);
     }
+    console.log(`[${requestId}] account_unavailable stream=no key=${userId}`);
     sendAccountUnavailableResponse(res, router, false);
     return;
   }

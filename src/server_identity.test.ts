@@ -72,6 +72,40 @@ test("different conversations under the same body.user get different keys", () =
   assert.notEqual(key1, key2);
 });
 
+test("prefers conversation metadata over body.user when present", () => {
+  const key = resolveSessionKey(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([
+      { role: "system", content: "**Name:** helper-bot" },
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"conversation_label":"dm:allen","sender_id":"123"}\n```',
+      },
+    ], "agent-123")
+  );
+  assert.equal(key, "meta:dm:allen::agent:helper-bot");
+});
+
+test("metadata key stays stable even when later assistant content changes", () => {
+  const req = makeRequest({}, "127.0.0.1");
+  const base = [
+    { role: "system", content: "**Name:** helper-bot" },
+    {
+      role: "user",
+      content:
+        'Conversation info (untrusted metadata):\n```json\n{"conversation_label":"dm:allen","sender_id":"123"}\n```',
+    },
+  ] as OpenAIRequest["messages"];
+
+  const key1 = resolveSessionKey(req, makeBody(base));
+  const key2 = resolveSessionKey(
+    req,
+    makeBody([...base, { role: "assistant", content: "NO_REPLY" }, { role: "user", content: "next turn" }])
+  );
+  assert.equal(key1, key2);
+});
+
 test("identity inspection reports fallback source details", () => {
   const identity = inspectSessionIdentity(
     makeRequest({}, "10.0.0.9"),
@@ -79,6 +113,22 @@ test("identity inspection reports fallback source details", () => {
   );
   assert.equal(identity.source, "fallback");
   assert.match(identity.detail, /ip=10\.0\.0\.9 fingerprint=/);
+});
+
+test("identity inspection reports metadata source details", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([
+      { role: "developer", content: "**Name:** helper-bot" },
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"conversation_label":"dm:allen","sender_id":"123"}\n```',
+      },
+    ])
+  );
+  assert.equal(identity.source, "metadata");
+  assert.match(identity.detail, /conversation_label=dm:allen/);
 });
 
 test("resume is allowed for explicit session headers", () => {
@@ -93,6 +143,21 @@ test("resume is allowed for body.user identities", () => {
   const identity = inspectSessionIdentity(
     makeRequest({}, "10.0.0.1"),
     makeBody([{ role: "user", content: "Hello" }], "agent-123")
+  );
+  assert.equal(identityAllowsResume(identity), true);
+});
+
+test("resume is allowed for metadata identities", () => {
+  const identity = inspectSessionIdentity(
+    makeRequest({}, "127.0.0.1"),
+    makeBody([
+      { role: "system", content: "**Name:** helper-bot" },
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"conversation_label":"dm:allen","sender_id":"123"}\n```',
+      },
+    ])
   );
   assert.equal(identityAllowsResume(identity), true);
 });

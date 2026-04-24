@@ -68,7 +68,7 @@ const SESSION_HEADER_CANDIDATES = [
 
 export interface SessionIdentityInfo {
   key: string;
-  source: "user" | "header" | "fallback";
+  source: "user" | "header" | "metadata" | "fallback";
   detail: string;
 }
 
@@ -84,6 +84,7 @@ function isTrustedLocalFallback(identity: SessionIdentityInfo): boolean {
 export function identityAllowsResume(identity: SessionIdentityInfo): boolean {
   return (
     identity.source === "header" ||
+    identity.source === "metadata" ||
     identity.source === "user" ||
     isTrustedLocalFallback(identity)
   );
@@ -132,6 +133,65 @@ function isEmptySessionEntry(session: SessionEntry): boolean {
   return session.lastMessageCount === 0 && session.messageSnapshot.length === 0;
 }
 
+function extractConversationMetadata(messages: OpenAIMessage[]): {
+  conversationLabel?: string;
+  senderId?: string;
+  rawJson?: string;
+} {
+  const marker = "Conversation info (untrusted metadata):";
+
+  for (const msg of messages) {
+    if (msg.role !== "user") continue;
+    const text = firstTextBlock(msg);
+    const markerIndex = text.indexOf(marker);
+    if (markerIndex === -1) continue;
+
+    const jsonFenceStart = text.indexOf("```json", markerIndex);
+    const jsonFenceEnd = jsonFenceStart === -1 ? -1 : text.indexOf("```", jsonFenceStart + 7);
+    if (jsonFenceStart === -1 || jsonFenceEnd === -1) continue;
+
+    const rawJson = text.slice(jsonFenceStart + 7, jsonFenceEnd).trim();
+    try {
+      const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+      const conversationLabel =
+        typeof parsed.conversation_label === "string" && parsed.conversation_label.trim()
+          ? parsed.conversation_label.trim()
+          : undefined;
+      const senderId =
+        typeof parsed.sender_id === "string" && parsed.sender_id.trim()
+          ? parsed.sender_id.trim()
+          : typeof parsed.sender_id === "number"
+            ? String(parsed.sender_id)
+            : undefined;
+      return { conversationLabel, senderId, rawJson };
+    } catch {
+      return { rawJson };
+    }
+  }
+
+  return {};
+}
+
+function extractAgentName(messages: OpenAIMessage[]): string | undefined {
+  const namePatterns = [
+    /\*\*Name:\*\*\s*([^\n]+)/i,
+    /^Name:\s*([^\n]+)/im,
+  ];
+
+  for (const msg of messages) {
+    if (msg.role !== "system" && msg.role !== "developer") continue;
+    const text = firstTextBlock(msg);
+    for (const pattern of namePatterns) {
+      const match = text.match(pattern);
+      if (match?.[1]?.trim()) {
+        return match[1].trim();
+      }
+    }
+  }
+
+  return undefined;
+}
+
 function makeConversationFingerprint(messages: OpenAIMessage[]): { fingerprint: string; seedParts: string[] } {
   const seedParts: string[] = [];
 
@@ -178,6 +238,23 @@ export function inspectSessionIdentity(req: Request, body: OpenAIRequest): Sessi
   console.log(
     `[Fingerprint] messages=${body.messages?.length ?? 0} | seed_parts=${seedParts.length} | seed=${JSON.stringify(seedParts.map((part) => shortText(part, 180)))} | fingerprint=${fingerprint}`
   );
+
+  const metadata = extractConversationMetadata(body.messages ?? []);
+  const agentName = extractAgentName(body.messages ?? []);
+  if (metadata.rawJson) {
+    console.log(
+      `[Metadata] conversation_label=${metadata.conversationLabel || "(empty)"} | sender_id=${metadata.senderId || "(empty)"} | agent=${agentName || "(empty)"}`
+    );
+  }
+
+  if (metadata.conversationLabel) {
+    const agentPart = agentName ? `::agent:${agentName}` : "";
+    return {
+      key: `meta:${metadata.conversationLabel}${agentPart}`,
+      source: "metadata",
+      detail: `conversation_label=${metadata.conversationLabel}${agentName ? ` agent=${agentName}` : ""}`,
+    };
+  }
 
   if (explicitUser) {
     return {

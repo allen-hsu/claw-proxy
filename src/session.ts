@@ -4,7 +4,7 @@ import { v4 as uuid } from "uuid";
 export interface SessionEntry {
   sessionId: string;
   accountName: string;
-  identitySource?: "user" | "header" | "fallback";
+  identitySource?: "user" | "header" | "metadata" | "fallback";
   allowResume?: boolean;
   toolCallIds: Set<string>;
   lastMessageCount: number;
@@ -179,7 +179,7 @@ export class SessionManager {
 
   updateMetadata(
     userId: string,
-    metadata: { identitySource: "user" | "header" | "fallback"; allowResume: boolean }
+    metadata: { identitySource: "user" | "header" | "metadata" | "fallback"; allowResume: boolean }
   ): void {
     const session = this.sessionsByUser.get(userId);
     if (!session) return;
@@ -239,7 +239,7 @@ export class SessionManager {
       sessionId: string;
       busy: boolean;
       accountName: string;
-      identitySource?: "user" | "header" | "fallback";
+      identitySource?: "user" | "header" | "metadata" | "fallback";
       allowResume?: boolean;
       lastUsedAt: number;
     }>;

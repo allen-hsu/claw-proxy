@@ -778,6 +778,11 @@ async function handleStreamWithRetry(
 
     if (rateLimited) {
       console.error(`[${requestId}] Rate limit text on ${account.account.name}, no retries left (attempt=${attempt + 1}/${maxAttempts})`);
+      router.cooldown(account, rateCooldownMs);
+      sessions.invalidateSession(userId);
+      cleanup();
+      sendAccountUnavailableResponse(res, router, true);
+      return;
     }
 
     if (result.is_error) {
@@ -1118,6 +1123,11 @@ async function handleSyncWithRetry(
 
     if (rateLimited) {
       console.error(`[${requestId}] Rate limit text on ${account.account.name}, no retries left (attempt=${attempt + 1}/${maxAttempts})`);
+      router.cooldown(account, rateCooldownMs);
+      sessions.invalidateSession(userId);
+      cleanup();
+      sendAccountUnavailableResponse(res, router, false);
+      return;
     }
 
     if (result.is_error) {

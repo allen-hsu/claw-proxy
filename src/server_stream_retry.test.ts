@@ -92,4 +92,33 @@ test("cooldown stream response writes SSE payload even after headers were sent",
   assert.equal(res.writes[1], "data: [DONE]\n\n");
 });
 
+test("cooldown stream response uses HTTP 429 before SSE starts", () => {
+  const router = new AccountRouter([{ name: "acct1", oauthToken: "token" }]);
+  const account = router.acquire("user-1");
+  assert.ok(account);
+  router.cooldown(account, 10_000);
+  router.release(account);
+
+  const res = makeResponse();
+
+  sendAccountUnavailableResponse(res, router, true);
+
+  assert.equal(res.statusCode, 429);
+  assert.equal(res.writableEnded, true);
+  assert.equal(res.writes.length, 0);
+  assert.match(JSON.stringify(res.jsonBody), /all_accounts_rate_limited/);
+});
+
+test("empty stream response uses HTTP 503 before SSE starts", () => {
+  const router = new AccountRouter([]);
+  const res = makeResponse();
+
+  sendAccountUnavailableResponse(res, router, true);
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.writableEnded, true);
+  assert.equal(res.writes.length, 0);
+  assert.match(JSON.stringify(res.jsonBody), /No Claude accounts/);
+});
+
 console.log("");

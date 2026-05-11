@@ -21,7 +21,6 @@ import {
   isMessagePrefix,
 } from "./adapter.js";
 
-const MAX_RETRIES = 3;
 const AUTH_COOLDOWN_MS = 300_000; // 5 minutes
 const RATE_COOLDOWN_MS = 60_000;  // 1 minute (fallback)
 const EXIT_COOLDOWN_MS = 30_000;  // 30 seconds
@@ -54,7 +53,7 @@ export function isRateLimit(text: string): boolean {
 }
 
 function maxAttemptsFor(router: AccountRouter): number {
-  return Math.max(MAX_RETRIES, router.status().length);
+  return Math.max(1, router.status().length);
 }
 
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
@@ -503,6 +502,10 @@ export function sendAccountUnavailableResponse(
     }
 
     if (stream) {
+      if (!res.headersSent) {
+        res.status(429).json(payload);
+        return;
+      }
       beginSse(res);
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
       res.write("data: [DONE]\n\n");
@@ -522,6 +525,10 @@ export function sendAccountUnavailableResponse(
   };
 
   if (stream) {
+    if (!res.headersSent) {
+      res.status(503).json(payload);
+      return;
+    }
     beginSse(res);
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
     res.write("data: [DONE]\n\n");
@@ -549,6 +556,13 @@ async function handleStreamWithRetry(
   identitySource: SessionIdentityInfo["source"]
 ): Promise<void> {
   const maxAttempts = maxAttemptsFor(router);
+  const unavailable = router.unavailableInfo();
+  if (router.status().length === 0 || unavailable.reason === "cooldown") {
+    console.log(`[${requestId}] account_unavailable_preflight stream=yes key=${userId}`);
+    sendAccountUnavailableResponse(res, router, true);
+    return;
+  }
+
   // 1. Acquire session lock first (may wait if session is busy)
   let handle = await sessions.acquireSession(userId);
 
@@ -882,6 +896,13 @@ async function handleSyncWithRetry(
   identitySource: SessionIdentityInfo["source"]
 ): Promise<void> {
   const maxAttempts = maxAttemptsFor(router);
+  const unavailable = router.unavailableInfo();
+  if (router.status().length === 0 || unavailable.reason === "cooldown") {
+    console.log(`[${requestId}] account_unavailable_preflight stream=no key=${userId}`);
+    sendAccountUnavailableResponse(res, router, false);
+    return;
+  }
+
   let handle = await sessions.acquireSession(userId);
 
   const maybeAccount = router.acquire(userId);

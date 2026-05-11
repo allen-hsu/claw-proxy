@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { isRateLimit } from "./server.js";
+import { incomingAssistantRateLimitCooldownMs, isRateLimit } from "./server.js";
 
 function test(name: string, fn: () => void) {
   try {
@@ -31,6 +31,30 @@ test("detects out of extra usage message", () => {
 
 test("does not classify generic auth failures as rate limits", () => {
   assert.equal(isRateLimit("Unauthorized: invalid token"), false);
+});
+
+test("detects recent assistant rate limit transcript", () => {
+  const cooldownMs = incomingAssistantRateLimitCooldownMs(
+    [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "You've hit your limit · resets 3:20am (Asia/Taipei)" },
+    ],
+    Date.UTC(2026, 4, 10, 18, 0)
+  );
+
+  assert.equal(cooldownMs, 80 * 60 * 1000);
+});
+
+test("ignores older assistant rate limit transcript", () => {
+  const cooldownMs = incomingAssistantRateLimitCooldownMs([
+    { role: "assistant", content: "You've hit your limit · resets 3:20am (Asia/Taipei)" },
+    { role: "user", content: "next" },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "next" },
+    { role: "assistant", content: "ok" },
+  ]);
+
+  assert.equal(cooldownMs, null);
 });
 
 console.log("");

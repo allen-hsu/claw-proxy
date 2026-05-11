@@ -52,6 +52,52 @@ export function isRateLimit(text: string): boolean {
   );
 }
 
+function parseRateLimitResetMs(text: string, nowMs: number = Date.now()): number | null {
+  const match = /\bresets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b(?:\s*\(Asia\/Taipei\))?/i.exec(text);
+  if (!match) return null;
+
+  let hour = Number(match[1]);
+  const minute = match[2] ? Number(match[2]) : 0;
+  const meridiem = match[3].toLowerCase();
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 1 || hour > 12 || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  if (hour === 12) hour = 0;
+  if (meridiem === "pm") hour += 12;
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(nowMs));
+  const getPart = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+  const year = getPart("year");
+  const month = getPart("month");
+  const day = getPart("day");
+  if (!year || !month || !day) return null;
+
+  let resetAtMs = Date.UTC(year, month - 1, day, hour - 8, minute);
+  if (resetAtMs <= nowMs) resetAtMs += 24 * 60 * 60 * 1000;
+  return Math.max(resetAtMs - nowMs, RATE_COOLDOWN_MS);
+}
+
+export function incomingAssistantRateLimitCooldownMs(
+  messages: OpenAIMessage[],
+  nowMs: number = Date.now()
+): number | null {
+  const recentMessages = messages.slice(-4);
+  for (let index = recentMessages.length - 1; index >= 0; index--) {
+    const message = recentMessages[index];
+    if (message.role !== "assistant") continue;
+    const text = firstTextBlock(message);
+    if (!isRateLimit(text)) continue;
+    return parseRateLimitResetMs(text, nowMs) ?? RATE_COOLDOWN_MS;
+  }
+  return null;
+}
+
 function maxAttemptsFor(router: AccountRouter): number {
   return Math.max(1, router.status().length);
 }
@@ -562,6 +608,21 @@ async function handleStreamWithRetry(
     sendAccountUnavailableResponse(res, router, true);
     return;
   }
+  const incomingCooldownMs = router.status().length === 1
+    ? incomingAssistantRateLimitCooldownMs(messages)
+    : null;
+  if (incomingCooldownMs !== null) {
+    const account = router.acquire(userId);
+    if (account) {
+      router.cooldown(account, incomingCooldownMs);
+      router.release(account);
+    }
+    console.log(
+      `[${requestId}] incoming_rate_limit_preflight stream=yes key=${userId} cooldown=${Math.round(incomingCooldownMs / 1000)}s`
+    );
+    sendAccountUnavailableResponse(res, router, true);
+    return;
+  }
 
   // 1. Acquire session lock first (may wait if session is busy)
   let handle = await sessions.acquireSession(userId);
@@ -904,6 +965,21 @@ async function handleSyncWithRetry(
   const unavailable = router.unavailableInfo();
   if (router.status().length === 0 || unavailable.reason === "cooldown") {
     console.log(`[${requestId}] account_unavailable_preflight stream=no key=${userId}`);
+    sendAccountUnavailableResponse(res, router, false);
+    return;
+  }
+  const incomingCooldownMs = router.status().length === 1
+    ? incomingAssistantRateLimitCooldownMs(messages)
+    : null;
+  if (incomingCooldownMs !== null) {
+    const account = router.acquire(userId);
+    if (account) {
+      router.cooldown(account, incomingCooldownMs);
+      router.release(account);
+    }
+    console.log(
+      `[${requestId}] incoming_rate_limit_preflight stream=no key=${userId} cooldown=${Math.round(incomingCooldownMs / 1000)}s`
+    );
     sendAccountUnavailableResponse(res, router, false);
     return;
   }

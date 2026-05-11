@@ -329,7 +329,12 @@ export function getPrimaryKeyResumeMode(
     return { mode: prompt ? "resume" : "skip", prompt: prompt || null };
   }
   if (messages.length === session.lastMessageCount) {
-    return { mode: "noop", prompt: null };
+    const unchanged = session.messageSnapshot.length > 0 && isMessagePrefix(session.messageSnapshot, messages);
+    if (unchanged) {
+      return { mode: "noop", prompt: null };
+    }
+    const prompt = extractNewMessages(messages, countLeadingSetupMessages(messages));
+    return { mode: prompt ? "refresh" : "rebuild", prompt: prompt || null };
   }
   const prompt = extractNewMessages(messages, countLeadingSetupMessages(messages));
   return { mode: prompt ? "refresh" : "rebuild", prompt: prompt || null };
@@ -598,6 +603,14 @@ async function handleStreamWithRetry(
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
+  let done = false;
+
+  function cleanup() {
+    if (done) return;
+    done = true;
+    handle.release();
+    router.release(account);
+  }
 
   if (primaryKeyResume.mode === "noop") {
     console.log(`[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NOOP same_primary_key`);
@@ -640,18 +653,10 @@ async function handleStreamWithRetry(
 
   const abort = new AbortController();
   const proc = new ClaudeProcess();
-  let done = false;
   let fullText = "";
   let structuredToolCalls: ReturnType<typeof parseStructuredToolCalls> = [];
   let rateLimitResetsAt = 0;
   let sessionCollision = false;
-
-  function cleanup() {
-    if (done) return;
-    done = true;
-    handle.release();
-    router.release(account);
-  }
 
   // Client disconnect — only invalidate if we didn't finish normally
   // (res.end() also fires "close", but cleanup() will have set done=true by then)
@@ -926,6 +931,14 @@ async function handleSyncWithRetry(
   let prompt: string;
   let spawnSessionId: string | undefined;
   let spawnResumeId: string | undefined;
+  let done = false;
+
+  function cleanup() {
+    if (done) return;
+    done = true;
+    handle.release();
+    router.release(account);
+  }
 
   if (primaryKeyResume.mode === "noop") {
     console.log(`[${requestId}] attempt=${attempt + 1} | account=${account.account.name} | NOOP same_primary_key`);
@@ -977,18 +990,10 @@ async function handleSyncWithRetry(
 
   const abort = new AbortController();
   const proc = new ClaudeProcess();
-  let done = false;
   let fullText = "";
   let structuredToolCalls: ReturnType<typeof parseStructuredToolCalls> = [];
   let rateLimitResetsAt = 0;
   let sessionCollision = false;
-
-  function cleanup() {
-    if (done) return;
-    done = true;
-    handle.release();
-    router.release(account);
-  }
 
   // Client disconnect — only invalidate if we didn't finish normally
   // (res.end() also fires "close", but cleanup() will have set done=true by then)

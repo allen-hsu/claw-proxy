@@ -99,7 +99,10 @@ test("metadata primary key resumes by message count growth", () => {
 test("metadata primary key returns noop when message count is unchanged", () => {
   const session = makeSession({
     lastMessageCount: 2,
-    messageSnapshot: ['{"content":"Hello","role":"user"}'],
+    messageSnapshot: [
+      '{"content":"Hello","role":"user"}',
+      '{"content":"Hi","role":"assistant"}',
+    ],
   });
   const messages: OpenAIMessage[] = [
     { role: "user", content: "Hello" },
@@ -107,6 +110,23 @@ test("metadata primary key returns noop when message count is unchanged", () => 
   ];
   const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
   assert.equal(result.mode, "noop");
+});
+
+test("metadata primary key refreshes when message count is unchanged but transcript changed", () => {
+  const session = makeSession({
+    lastMessageCount: 2,
+    messageSnapshot: [
+      '{"content":"Hello","role":"user"}',
+      '{"content":"Hi","role":"assistant"}',
+    ],
+  });
+  const messages: OpenAIMessage[] = [
+    { role: "system", content: "You are helpful." },
+    { role: "user", content: "Changed" },
+  ];
+  const result = getPrimaryKeyResumeMode(session, messages, "metadata", false, true);
+  assert.equal(result.mode, "refresh");
+  assert.equal(result.prompt, "User: Changed");
 });
 
 test("metadata primary key requests rebuild when transcript shrinks", () => {
